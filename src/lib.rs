@@ -10,10 +10,12 @@ pub mod data;
 pub mod error;
 pub mod parser;
 pub mod vfs;
+pub mod get_llm_instructions;
 
 pub use apply::apply;
 pub use error::ZenpatchError;
 pub use vfs::Vfs;
+pub use get_llm_instructions::get_llm_instructions;
 
 #[cfg(test)]
 pub mod tests;

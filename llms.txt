@@ -1,0 +1,76 @@
+Zenpatch Patch Format for LLMs
+
+This document describes the text-based patch format used by the Zenpatch library. It is designed to be simple for Large Language Models (LLMs) to generate.
+
+## Overall Structure
+
+A patch starts with `*** Begin Patch` and ends with `*** End Patch` on their own lines.
+Between these markers, one or more file operations (hunks) can be listed.
+
+```
+*** Begin Patch
+... file operations ...
+*** End Patch
+```
+
+## File Operations
+
+There are three types of file operations: updating, adding, and deleting.
+
+### 1. Updating a File
+
+To update an existing file, use the `*** Update File:` directive.
+
+- **Directive:** `*** Update File: path/to/your/file.ext`
+- **Hunks:** Each change within the file is specified in a hunk starting with `@@`.
+- **Line Prefixes:**
+    - ` ` (space): A context line, which must match the existing content in the file.
+    - `-`: A line to be deleted.
+    - `+`: A line to be added.
+
+**Example:**
+
+```
+*** Update File: src/main.rs
+@@
+ // some context
+-let old_variable = 1;
++let new_variable = 2;
+ // more context
+```
+
+### 2. Adding a New File
+
+To create a new file, use the `*** Add File:` directive.
+
+- **Directive:** `*** Add File: path/to/new/file.ext`
+- **Content:** Every line of content for the new file must start with a `+`.
+
+**Example:**
+
+```
+*** Add File: new_feature.rs
++fn new_function() {
++    // implementation
++}
+```
+
+### 3. Deleting a File
+
+To delete an existing file, use the `*** Delete File:` directive.
+
+- **Directive:** `*** Delete File: path/to/be/deleted.txt`
+- **Content:** The content to be deleted can optionally be included, prefixed with `-`. The patcher primarily uses the filename for deletion.
+
+**Example:**
+
+```
+*** Delete File: old_config.toml
+-some_setting = "old_value"
+```
+
+## Key Principles for Robust Patches
+
+1.  **Context is Key:** For `Update File` operations, provide enough surrounding context lines (lines with a leading space) to uniquely identify the location of the change. This is more robust than relying on line numbers.
+2.  **One Change at a Time:** While a patch file can contain multiple hunks (`@@`) for a single file, it's often clearer and safer to have each hunk represent a single, contiguous change.
+3.  **Exact Match:** Context and deleted lines must match the content in the file exactly, including whitespace.

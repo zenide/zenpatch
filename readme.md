@@ -51,3 +51,7 @@ fn main() -> Result<(), ZenpatchError> {
     Ok(())
 }
 ```
+
+## Patch Format
+
+For detailed instructions on the text-based patch format, especially for use in AI coding agents, please refer to the `llms.txt` file in this crate. The content of this file is also available programmatically via the `zenpatch::get_llm_instructions()` function.
