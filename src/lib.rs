@@ -9,9 +9,11 @@ pub mod applier;
 pub mod data;
 pub mod error;
 pub mod parser;
+pub mod vfs;
 
 pub use apply::apply;
 pub use error::ZenpatchError;
+pub use vfs::Vfs;
 
 #[cfg(test)]
 pub mod tests;

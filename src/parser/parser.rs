@@ -27,44 +27,33 @@ impl Parser {
     /// Returns an error if the patch does not contain exactly one file directive.
     pub fn parse(
         &mut self,
-    ) -> std::result::Result<crate::data::patch_action::PatchAction, crate::error::ZenpatchError> {
+    ) -> std::result::Result<std::vec::Vec<crate::data::patch_action::PatchAction>, crate::error::ZenpatchError>
+    {
         self.index = 1; // Skip "*** Begin Patch"
 
-        let mut action: std::option::Option<crate::data::patch_action::PatchAction> =
-            std::option::Option::None;
+        let mut actions = std::vec::Vec::new();
 
         while self.index < self.lines.len() - 1 {
             let line = self.lines[self.index].trim();
 
-            if line.starts_with("*** Add File: ")
-                || line.starts_with("*** Update File: ")
-                || line.starts_with("*** Delete File: ")
-            {
-                if action.is_some() {
-                    return std::result::Result::Err(
-                        crate::error::ZenpatchError::InvalidPatchFormat(
-                            "Multiple file directives found in a single patch.".to_string(),
-                        ),
-                    );
-                }
-
-                if line.starts_with("*** Add File: ") {
-                    action = std::option::Option::Some(self.parse_add_file()?);
-                } else if line.starts_with("*** Update File: ") {
-                    action = std::option::Option::Some(self.parse_update_file()?);
-                } else if line.starts_with("*** Delete File: ") {
-                    action = std::option::Option::Some(self.parse_delete_file()?);
-                }
+            if line.starts_with("*** Add File: ") {
+                actions.push(self.parse_add_file()?);
+            } else if line.starts_with("*** Update File: ") {
+                actions.push(self.parse_update_file()?);
+            } else if line.starts_with("*** Delete File: ") {
+                actions.push(self.parse_delete_file()?);
             } else {
                 self.index += 1;
             }
         }
 
-        action.ok_or_else(|| {
-            crate::error::ZenpatchError::InvalidPatchFormat(
+        if actions.is_empty() {
+            return std::result::Result::Err(crate::error::ZenpatchError::InvalidPatchFormat(
                 "No file directive found in patch.".to_string(),
-            )
-        })
+            ));
+        }
+
+        std::result::Result::Ok(actions)
     }
 
     fn parse_add_file(
@@ -195,11 +184,32 @@ impl Parser {
             .to_string();
         self.index += 1;
 
+        let mut lines = std::vec::Vec::new();
+        while self.index < self.lines.len() && !self.lines[self.index].starts_with("*** ") {
+            let line_content = &self.lines[self.index];
+            if line_content.starts_with('-') {
+                let content = line_content[1..].to_string();
+                lines.push((crate::data::line_type::LineType::Deletion, content));
+            }
+            self.index += 1;
+        }
+
+        let chunks = if lines.is_empty() {
+            std::vec::Vec::new()
+        } else {
+            std::vec![crate::data::chunk::Chunk {
+                orig_index: 0,
+                lines,
+                del_lines: std::vec::Vec::new(),
+                ins_lines: std::vec::Vec::new(),
+            }]
+        };
+
         std::result::Result::Ok(crate::data::patch_action::PatchAction {
             type_: crate::data::action_type::ActionType::Delete,
             path: filename,
             new_path: std::option::Option::None,
-            chunks: std::vec::Vec::new(),
+            chunks,
         })
     }
 }
@@ -213,8 +223,10 @@ mod tests {
     fn test_parse_add_file() {
         let content = "*** Begin Patch\n*** Add File: new.txt\n+hello\n+world\n*** End Patch";
         let mut parser = Parser::new(content);
-        let action = parser.parse().unwrap();
+        let actions = parser.parse().unwrap();
 
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
         assert_eq!(action.type_, ActionType::Add);
         assert_eq!(action.path, "new.txt");
         assert_eq!(action.chunks.len(), 1);
@@ -234,10 +246,28 @@ mod tests {
     fn test_parse_delete_file() {
         let content = "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch";
         let mut parser = Parser::new(content);
-        let action = parser.parse().unwrap();
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
         assert_eq!(action.type_, ActionType::Delete);
         assert_eq!(action.path, "old.txt");
         assert!(action.chunks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_delete_file_with_content() {
+        let content = "*** Begin Patch\n*** Delete File: old.txt\n-line1\n-line2\n*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
+        assert_eq!(action.type_, ActionType::Delete);
+        assert_eq!(action.path, "old.txt");
+        assert_eq!(action.chunks.len(), 1);
+        let chunk = &action.chunks[0];
+        assert_eq!(chunk.lines.len(), 2);
+        assert_eq!(chunk.lines[0], (LineType::Deletion, "line1".to_string()));
+        assert_eq!(chunk.lines[1], (LineType::Deletion, "line2".to_string()));
     }
 
     #[test]
@@ -245,7 +275,9 @@ mod tests {
         let content =
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-a\n+b\n c\n*** End Patch";
         let mut parser = Parser::new(content);
-        let action = parser.parse().unwrap();
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
         assert_eq!(action.type_, ActionType::Update);
         assert_eq!(action.path, "file.txt");
         assert_eq!(action.chunks.len(), 1);
@@ -260,8 +292,10 @@ mod tests {
     fn test_parse_update_with_move() {
         let content = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n+a\n*** End Patch";
         let mut parser = Parser::new(content);
-        let action = parser.parse().unwrap();
+        let actions = parser.parse().unwrap();
 
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
         assert_eq!(action.type_, ActionType::Update);
         assert_eq!(action.path, "old.txt");
         assert_eq!(action.new_path, Some("new.txt".to_string()));
@@ -269,18 +303,16 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_directives_error() {
+    fn test_multiple_directives_success() {
         let content =
             "*** Begin Patch\n*** Add File: a.txt\n+1\n*** Delete File: b.txt\n*** End Patch";
         let mut parser = Parser::new(content);
-        let result = parser.parse();
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            crate::error::ZenpatchError::InvalidPatchFormat(msg) => {
-                assert!(msg.contains("Multiple file directives"));
-            }
-            _ => panic!("Expected InvalidPatchFormat error"),
-        }
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].type_, ActionType::Add);
+        assert_eq!(actions[0].path, "a.txt");
+        assert_eq!(actions[1].type_, ActionType::Delete);
+        assert_eq!(actions[1].path, "b.txt");
     }
 
     #[test]

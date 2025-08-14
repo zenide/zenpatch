@@ -19,7 +19,8 @@
 /// * `Err(ZenpatchError)` - An error if the patch text is invalid or parsing fails.
 pub fn text_to_patch(
     text: &str,
-) -> std::result::Result<crate::data::patch_action::PatchAction, crate::error::ZenpatchError> {
+) -> std::result::Result<std::vec::Vec<crate::data::patch_action::PatchAction>, crate::error::ZenpatchError>
+{
     let trimmed_text = text.trim();
     let lines: std::vec::Vec<&str> = trimmed_text.lines().collect();
 
@@ -40,36 +41,38 @@ pub fn text_to_patch(
     }
 
     let mut parser = crate::parser::parser::Parser::new(trimmed_text);
-    let mut action = parser.parse()?;
+    let mut actions = parser.parse()?;
 
     // Post-process chunks to populate del_lines and ins_lines
-    for chunk in &mut action.chunks {
-        chunk.del_lines = chunk
-            .lines
-            .iter()
-            .filter_map(|(lt, content)| {
-                if *lt == crate::data::line_type::LineType::Deletion {
-                    std::option::Option::Some(content.clone())
-                } else {
-                    std::option::Option::None
-                }
-            })
-            .collect();
+    for action in &mut actions {
+        for chunk in &mut action.chunks {
+            chunk.del_lines = chunk
+                .lines
+                .iter()
+                .filter_map(|(lt, content)| {
+                    if *lt == crate::data::line_type::LineType::Deletion {
+                        std::option::Option::Some(content.clone())
+                    } else {
+                        std::option::Option::None
+                    }
+                })
+                .collect();
 
-        chunk.ins_lines = chunk
-            .lines
-            .iter()
-            .filter_map(|(lt, content)| {
-                if *lt == crate::data::line_type::LineType::Insertion {
-                    std::option::Option::Some(content.clone())
-                } else {
-                    std::option::Option::None
-                }
-            })
-            .collect();
+            chunk.ins_lines = chunk
+                .lines
+                .iter()
+                .filter_map(|(lt, content)| {
+                    if *lt == crate::data::line_type::LineType::Insertion {
+                        std::option::Option::Some(content.clone())
+                    } else {
+                        std::option::Option::None
+                    }
+                })
+                .collect();
+        }
     }
 
-    std::result::Result::Ok(action)
+    std::result::Result::Ok(actions)
 }
 
 #[cfg(test)]
@@ -83,9 +86,10 @@ mod tests {
         let patch_text = "*** Begin Patch\n*** Add File: new.txt\n+content\n*** End Patch";
         let result = text_to_patch(patch_text);
         assert!(result.is_ok());
-        let action = result.unwrap();
-        assert_eq!(action.type_, ActionType::Add);
-        assert_eq!(action.path, "new.txt");
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].type_, ActionType::Add);
+        assert_eq!(actions[0].path, "new.txt");
     }
 
     #[test]
@@ -155,8 +159,9 @@ mod tests {
         let result = text_to_patch(patch_text);
         assert!(result.is_ok(), "Parsing failed: {:?}", result);
 
-        let action = result.unwrap();
-
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
         assert_eq!(action.type_, ActionType::Update);
         assert_eq!(action.path, "file.txt");
         assert_eq!(action.chunks.len(), 1, "Update action should have one chunk");
@@ -169,21 +174,17 @@ mod tests {
     }
 
     #[test]
-    fn test_text_to_patch_multiple_actions_fails() {
+    fn test_text_to_patch_multiple_actions_succeeds() {
         let patch_text = "*** Begin Patch\n\
 *** Add File: new_file.txt\n\
 +New content\n\
 *** Delete File: old_file.txt\n\
 *** End Patch";
 
-        let result = text_to_patch(patch_text);
-        assert!(result.is_err(), "Parsing should fail for multiple actions");
-
-        match result.unwrap_err() {
-            crate::error::ZenpatchError::InvalidPatchFormat(msg) => {
-                assert!(msg.contains("Multiple file directives"));
-            }
-            _ => panic!("Expected InvalidPatchFormat error"),
-        }
+        let actions = text_to_patch(patch_text).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].type_, ActionType::Add);
+        assert_eq!(actions[1].type_, ActionType::Delete);
+        assert_eq!(actions[1].path, "old_file.txt");
     }
 }
