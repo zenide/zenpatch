@@ -3,6 +3,13 @@ name = "zenpatch"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "A robust library for applying text-based patches, designed for AI coding agents with backtracking algorithm"
+homepage = "https://github.com/zenide/zenpatch"
+repository = "https://github.com/zenide/zenpatch"
+keywords = ["patch", "diff", "ai", "vfs", "backtracking"]
+categories = ["development-tools", "text-processing"]
+authors = ["Paweł Jankiewicz <p.jankiewicz@gmail.com>"]
+readme = "README.md"
 
 [lib]
 name = "zenpatch"
