@@ -23,12 +23,14 @@ To update an existing file, use the `*** Update File:` directive.
 
 - **Directive:** `*** Update File: path/to/your/file.ext`
 - **Hunks:** Each change within the file is specified in a hunk starting with `@@`.
+- **Hunk Headers:** A bare `@@` starts a hunk. To disambiguate repeated patterns in large files, add a context string after `@@`: `@@ class MyClass:` or `@@ def my_function():`. The patcher uses this text to locate the nearest matching line and constrains the search to positions after it.
+- **End of File Marker:** Use `*** End of File` after the last line of a hunk to indicate the change must apply at the end of the file. This is useful when context lines appear multiple times and you want to anchor to the final occurrence.
 - **Line Prefixes:**
     - ` ` (space): A context line, which must match the existing content in the file.
     - `-`: A line to be deleted.
     - `+`: A line to be added.
 
-**Example:**
+**Example (basic):**
 
 ```
 *** Update File: src/main.rs
@@ -37,6 +39,26 @@ To update an existing file, use the `*** Update File:` directive.
 -let old_variable = 1;
 +let new_variable = 2;
  // more context
+```
+
+**Example (with @@ context for disambiguation):**
+
+```
+*** Update File: src/app.py
+@@ class UserService:
+ def update(self, user):
+-    self.db.save(user)
++    self.db.upsert(user)
+```
+
+**Example (with End of File marker):**
+
+```
+*** Update File: src/config.rs
+@@
+ // last config entry
++pub const NEW_SETTING: bool = true;
+*** End of File
 ```
 
 ### 2. Adding a New File
@@ -71,6 +93,8 @@ To delete an existing file, use the `*** Delete File:` directive.
 
 ## Key Principles for Robust Patches
 
-1.  **Context is Key:** For `Update File` operations, provide enough surrounding context lines (lines with a leading space) to uniquely identify the location of the change. This is more robust than relying on line numbers.
-2.  **One Change at a Time:** While a patch file can contain multiple hunks (`@@`) for a single file, it's often clearer and safer to have each hunk represent a single, contiguous change.
-3.  **Exact Match:** Context and deleted lines must match the content in the file exactly, including whitespace.
+1.  **Context is Key:** For `Update File` operations, provide at least 3 surrounding context lines (lines with a leading space) to uniquely identify the location of the change. This is more robust than relying on line numbers.
+2.  **Use `@@` Headers for Disambiguation:** When a file has repeated patterns (e.g., multiple methods with the same signature), add the enclosing class or function name to the `@@` header: `@@ class Foo:` or `@@ def bar():`. The patcher will only match positions after the first occurrence of that text.
+3.  **Use `*** End of File` for Tail Anchoring:** When appending to the end of a file or modifying the last occurrence of a pattern, add `*** End of File` after the hunk to constrain matching to the file's tail.
+4.  **One Change at a Time:** While a patch file can contain multiple hunks (`@@`) for a single file, it's often clearer and safer to have each hunk represent a single, contiguous change.
+5.  **Exact Match:** Context and deleted lines must match the content in the file exactly, including whitespace.

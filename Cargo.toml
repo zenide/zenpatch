@@ -16,9 +16,4 @@ name = "zenpatch"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.82"
-thiserror = "1.0"
-log = "0.4.22"
-similar = "2.7.0"
-regex = "1.11.0"
 serde = { version = "1.0", features = ["derive"] }

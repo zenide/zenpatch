@@ -16,6 +16,10 @@ pub struct Chunk {
     pub del_lines: std::vec::Vec<std::string::String>,
     /// Lines to be inserted. Populated by the parser.
     pub ins_lines: std::vec::Vec<std::string::String>,
+    /// Text from the `@@ <context>` header (e.g. class/function name for disambiguation).
+    pub change_context: std::option::Option<std::string::String>,
+    /// True when `*** End of File` was present after this chunk's lines.
+    pub is_end_of_file: bool,
 }
 
 impl Chunk {
@@ -25,6 +29,8 @@ impl Chunk {
             lines: std::vec::Vec::new(),
             del_lines: std::vec::Vec::new(),
             ins_lines: std::vec::Vec::new(),
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         }
     }
 }
@@ -41,6 +47,8 @@ mod tests {
             lines: std::vec::Vec::new(),
             del_lines: std::vec::Vec::new(),
             ins_lines: std::vec::Vec::new(),
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
         std::assert_eq!(chunk.orig_index, 0);
         std::assert!(chunk.lines.is_empty());
@@ -69,6 +77,8 @@ mod tests {
             lines: lines_data.clone(), // Clone for comparison
             del_lines: del_lines_data.clone(),
             ins_lines: ins_lines_data.clone(),
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
 
         std::assert_eq!(chunk.orig_index, 10);
@@ -93,6 +103,8 @@ mod tests {
             lines: std::vec![(crate::data::line_type::LineType::Context, std::string::String::from("a"))],
             del_lines: std::vec::Vec::new(),
             ins_lines: std::vec::Vec::new(),
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
         let chunk2 = chunk1.clone(); // Clone
         let chunk3 = super::Chunk {
@@ -100,12 +112,16 @@ mod tests {
             lines: std::vec![(crate::data::line_type::LineType::Context, std::string::String::from("a"))],
             del_lines: std::vec::Vec::new(),
             ins_lines: std::vec::Vec::new(),
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
          let chunk4 = super::Chunk {
             orig_index: 5,
             lines: std::vec![(crate::data::line_type::LineType::Deletion, std::string::String::from("a"))], // Different line type
             del_lines: std::vec![std::string::String::from("a")],
             ins_lines: std::vec::Vec::new(),
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
 
 

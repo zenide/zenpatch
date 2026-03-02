@@ -62,6 +62,8 @@ mod tests {
                   (crate::data::line_type::LineType::Insertion, std::string::String::from("new line"))],
             del_lines: std::vec![std::string::String::from("old line")],
             ins_lines: std::vec![std::string::String::from("new line")],
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
         let action = super::PatchAction {
             type_: crate::data::action_type::ActionType::Update,
@@ -99,6 +101,8 @@ mod tests {
             lines: std::vec![(crate::data::line_type::LineType::Insertion, std::string::String::from("added line"))],
             del_lines: std::vec::Vec::new(),
             ins_lines: std::vec![std::string::String::from("added line")],
+            change_context: std::option::Option::None,
+            is_end_of_file: false,
         };
         let action = super::PatchAction {
             type_: crate::data::action_type::ActionType::Update, // Or could be Add depending on patch format interpretation for moves
@@ -125,6 +129,8 @@ mod tests {
                 lines: std::vec![(crate::data::line_type::LineType::Insertion, std::string::String::from("a"))],
                 del_lines: std::vec::Vec::new(),
                 ins_lines: std::vec![std::string::String::from("a")],
+                change_context: std::option::Option::None,
+                is_end_of_file: false,
             }],
         };
         let action2 = action1.clone();

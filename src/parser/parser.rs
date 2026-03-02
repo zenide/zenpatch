@@ -86,6 +86,8 @@ impl Parser {
            lines,
            del_lines: std::vec::Vec::new(),
            ins_lines,
+           change_context: std::option::Option::None,
+           is_end_of_file: false,
        };
 
        std::result::Result::Ok(crate::data::patch_action::PatchAction {
@@ -129,11 +131,25 @@ impl Parser {
                 continue;
             }
 
+            if line == "*** End of File" {
+                current_chunk.is_end_of_file = true;
+                self.index += 1;
+                break;
+            }
+
             if line.starts_with("@@") {
                 if !current_chunk.lines.is_empty() {
                     chunks.push(current_chunk);
                 }
                 current_chunk = crate::data::chunk::Chunk::new();
+                // Extract change_context from "@@ <text>" header
+                let trimmed = &line[2..];
+                if !trimmed.is_empty() {
+                    let ctx = trimmed.trim_start();
+                    if !ctx.is_empty() {
+                        current_chunk.change_context = std::option::Option::Some(ctx.to_string());
+                    }
+                }
                 self.index += 1;
                 continue;
             }
@@ -202,6 +218,8 @@ impl Parser {
                 lines,
                 del_lines: std::vec::Vec::new(),
                 ins_lines: std::vec::Vec::new(),
+                change_context: std::option::Option::None,
+                is_end_of_file: false,
             }]
         };
 
@@ -327,5 +345,142 @@ mod tests {
             }
             _ => panic!("Expected InvalidPatchFormat error"),
         }
+    }
+
+    #[test]
+    fn test_update_multiple_chunks_with_move() {
+        let content = "*** Begin Patch\n\
+*** Update File: old.txt\n\
+*** Move to: new.txt\n\
+@@\n line1\n-line2\n+LINE2\n\
+@@\n line3\n-line4\n+LINE4\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions.len(), 1);
+        let action = &actions[0];
+        assert_eq!(action.type_, ActionType::Update);
+        assert_eq!(action.path, "old.txt");
+        assert_eq!(action.new_path, Some("new.txt".to_string()));
+        assert_eq!(action.chunks.len(), 2);
+        assert_eq!(action.chunks[0].lines[0], (LineType::Context, "line1".to_string()));
+        assert_eq!(action.chunks[0].lines[1], (LineType::Deletion, "line2".to_string()));
+        assert_eq!(action.chunks[0].lines[2], (LineType::Insertion, "LINE2".to_string()));
+        assert_eq!(action.chunks[1].lines[0], (LineType::Context, "line3".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_lines_inside_chunk_are_skipped() {
+        // Lines that don't start with ' ', '+', '-', or '@@' are skipped
+        let content = "*** Begin Patch\n*** Update File: f.txt\n@@\n context\nThis line has no valid prefix\n-del\n+ins\n*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions[0].chunks.len(), 1);
+        let chunk = &actions[0].chunks[0];
+        // The invalid line is skipped; only context, del, ins remain
+        assert_eq!(chunk.lines.len(), 3);
+        assert_eq!(chunk.lines[0], (LineType::Context, "context".to_string()));
+        assert_eq!(chunk.lines[1], (LineType::Deletion, "del".to_string()));
+        assert_eq!(chunk.lines[2], (LineType::Insertion, "ins".to_string()));
+    }
+
+    #[test]
+    fn test_empty_chunk_consecutive_at_markers() {
+        // Two @@ in a row: first chunk is empty, second has content
+        let content = "*** Begin Patch\n\
+*** Update File: f.txt\n\
+@@\n\
+@@\n\
+-old\n\
++new\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        // First @@ creates a chunk, second @@ pushes it (empty) then creates new one
+        // But the empty chunk has no lines, so it's not pushed
+        assert_eq!(actions[0].chunks.len(), 1);
+        assert_eq!(actions[0].chunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn test_file_path_with_spaces_and_special_chars() {
+        let content = "*** Begin Patch\n\
+*** Add File: path/to my file (1).txt\n\
++content\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions[0].path, "path/to my file (1).txt");
+    }
+
+    #[test]
+    fn test_file_path_with_unicode() {
+        let content = "*** Begin Patch\n\
+*** Add File: src/\u{00E9}l\u{00E8}ve.rs\n\
++fn main() {}\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions[0].path, "src/\u{00E9}l\u{00E8}ve.rs");
+    }
+
+    #[test]
+    fn test_parse_at_header_with_context_text() {
+        let content = "*** Begin Patch\n\
+*** Update File: file.py\n\
+@@ def foo():\n\
+-old\n\
++new\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions[0].chunks.len(), 1);
+        assert_eq!(
+            actions[0].chunks[0].change_context,
+            Some("def foo():".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_bare_at_header_no_context() {
+        let content = "*** Begin Patch\n\
+*** Update File: file.txt\n\
+@@\n\
+-old\n\
++new\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions[0].chunks.len(), 1);
+        assert_eq!(actions[0].chunks[0].change_context, None);
+    }
+
+    #[test]
+    fn test_parse_end_of_file_marker() {
+        let content = "*** Begin Patch\n\
+*** Update File: file.txt\n\
+@@\n\
+ last line\n\
++appended\n\
+*** End of File\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert_eq!(actions[0].chunks.len(), 1);
+        assert!(actions[0].chunks[0].is_end_of_file);
+    }
+
+    #[test]
+    fn test_parse_end_of_file_not_present() {
+        let content = "*** Begin Patch\n\
+*** Update File: file.txt\n\
+@@\n\
+ ctx\n\
+-old\n\
++new\n\
+*** End Patch";
+        let mut parser = Parser::new(content);
+        let actions = parser.parse().unwrap();
+        assert!(!actions[0].chunks[0].is_end_of_file);
     }
 }

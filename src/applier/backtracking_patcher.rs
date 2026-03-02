@@ -195,6 +195,37 @@ fn get_pre_context_lines(chunk: &Chunk) -> Vec<String> {
     ctx
 }
 
+fn apply_chunk_constraints(
+    positions: Vec<usize>,
+    lines: &[String],
+    chunk: &Chunk,
+    mode: WhitespaceMode,
+) -> Vec<usize> {
+    let mut filtered = positions;
+
+    // Filter by change_context: only keep positions strictly after the line matching the context
+    if let Some(ref ctx) = chunk.change_context {
+        let anchor = lines.iter().position(|l| match_line(l, ctx, mode));
+        if let Some(anchor_idx) = anchor {
+            filtered.retain(|&pos| pos > anchor_idx);
+        } else {
+            // Context string not found anywhere in the file → no valid positions
+            return Vec::new();
+        }
+    }
+
+    // Filter by is_end_of_file: the matched region must reach the end of the file
+    if chunk.is_end_of_file {
+        let pre_len = get_pre_context_lines(chunk).len();
+        let span = pre_len + chunk.del_lines.len();
+        // For pure insertions with context, the context + insertion should land at the end
+        let effective_span = if span == 0 { 0 } else { span };
+        filtered.retain(|&pos| pos + effective_span >= lines.len());
+    }
+
+    filtered
+}
+
 fn find_match_positions(
     lines: &Vec<String>,
     chunk: &Chunk,
@@ -225,12 +256,12 @@ fn find_match_positions(
                 }
             }
         }
-        return positions;
+        return apply_chunk_constraints(positions, lines, chunk, mode);
     }
 
     let clen = pre.len();
     if lines.len() < clen {
-        return positions;
+        return apply_chunk_constraints(positions, lines, chunk, mode);
     }
 
     let max_start = lines.len() - clen;
@@ -282,7 +313,7 @@ fn find_match_positions(
         }
     }
 
-    positions
+    apply_chunk_constraints(positions, lines, chunk, mode)
 }
 
 fn get_affected_indices(chunk: &Chunk, pos: usize, mode: WhitespaceMode) -> Vec<usize> {
@@ -466,5 +497,334 @@ fn backtrack_with_mode(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::chunk::Chunk;
+    use crate::data::line_type::LineType;
+
+    // ── match_line tests ──
+
+    #[test]
+    fn test_match_line_strict_exact() {
+        assert!(match_line("hello world", "hello world", WhitespaceMode::Strict));
+    }
+
+    #[test]
+    fn test_match_line_strict_whitespace_differs() {
+        assert!(!match_line("hello  world", "hello world", WhitespaceMode::Strict));
+        assert!(!match_line("  hello", "hello", WhitespaceMode::Strict));
+    }
+
+    #[test]
+    fn test_match_line_lenient_collapses_whitespace() {
+        assert!(match_line("hello  world", "hello world", WhitespaceMode::Lenient));
+        assert!(match_line("  hello  ", "hello", WhitespaceMode::Lenient));
+        assert!(match_line("\thello\tworld", "hello world", WhitespaceMode::Lenient));
+    }
+
+    #[test]
+    fn test_match_line_lenient_different_content() {
+        assert!(!match_line("hello", "world", WhitespaceMode::Lenient));
+    }
+
+    #[test]
+    fn test_match_line_super_lenient_fancy_quotes() {
+        assert!(match_line(
+            "\u{201C}hello\u{201D}",
+            "\"hello\"",
+            WhitespaceMode::SuperLenient
+        ));
+        assert!(match_line(
+            "\u{2018}it\u{2019}s\u{2019}",
+            "'it's'",
+            WhitespaceMode::SuperLenient
+        ));
+    }
+
+    #[test]
+    fn test_match_line_super_lenient_dashes() {
+        assert!(match_line("a\u{2014}b", "a-b", WhitespaceMode::SuperLenient));
+        assert!(match_line("a\u{2013}b", "a-b", WhitespaceMode::SuperLenient));
+        assert!(match_line("a\u{2212}b", "a-b", WhitespaceMode::SuperLenient));
+    }
+
+    #[test]
+    fn test_match_line_super_lenient_special_spaces() {
+        assert!(match_line(
+            "hello\u{00A0}world",
+            "hello world",
+            WhitespaceMode::SuperLenient
+        ));
+        assert!(match_line(
+            "hello\u{2003}world",
+            "hello world",
+            WhitespaceMode::SuperLenient
+        ));
+    }
+
+    // ── normalize / super_normalise tests ──
+
+    #[test]
+    fn test_normalize_collapses_whitespace() {
+        assert_eq!(normalize("  hello   world  "), "hello world");
+        assert_eq!(normalize("a"), "a");
+        assert_eq!(normalize(""), "");
+        assert_eq!(normalize("  \t\n  "), "");
+    }
+
+    #[test]
+    fn test_super_normalise_fancy_characters() {
+        assert_eq!(super_normalise("\u{201C}hi\u{201D}"), "\"hi\"");
+        assert_eq!(super_normalise("\u{2018}hi\u{2019}"), "'hi'");
+        assert_eq!(super_normalise("a\u{2014}b"), "a-b");
+        assert_eq!(super_normalise("\u{00A0}hi\u{00A0}"), "hi");
+    }
+
+    #[test]
+    fn test_super_normalise_trims() {
+        assert_eq!(super_normalise("  hello  "), "hello");
+    }
+
+    // ── apply_patch_backtracking direct tests ──
+
+    fn make_chunk(
+        context_before: &[&str],
+        deletions: &[&str],
+        insertions: &[&str],
+        context_after: &[&str],
+        orig_index: usize,
+    ) -> Chunk {
+        let mut lines = Vec::new();
+        for c in context_before {
+            lines.push((LineType::Context, c.to_string()));
+        }
+        for d in deletions {
+            lines.push((LineType::Deletion, d.to_string()));
+        }
+        for i in insertions {
+            lines.push((LineType::Insertion, i.to_string()));
+        }
+        for c in context_after {
+            lines.push((LineType::Context, c.to_string()));
+        }
+        Chunk {
+            orig_index,
+            lines,
+            del_lines: deletions.iter().map(|s| s.to_string()).collect(),
+            ins_lines: insertions.iter().map(|s| s.to_string()).collect(),
+            change_context: None,
+            is_end_of_file: false,
+        }
+    }
+
+    #[test]
+    fn test_single_chunk_replacement() {
+        let original: Vec<String> = vec!["aaa", "bbb", "ccc"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["aaa"], &["bbb"], &["BBB"], &["ccc"], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["aaa", "BBB", "ccc"]);
+    }
+
+    #[test]
+    fn test_pure_insertion_with_context() {
+        let original: Vec<String> = vec!["aaa", "ccc"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["aaa"], &[], &["bbb"], &["ccc"], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["aaa", "bbb", "ccc"]);
+    }
+
+    #[test]
+    fn test_pure_deletion() {
+        let original: Vec<String> = vec!["aaa", "bbb", "ccc"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["aaa"], &["bbb"], &[], &["ccc"], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["aaa", "ccc"]);
+    }
+
+    #[test]
+    fn test_empty_file_pure_insertion() {
+        let original: Vec<String> = vec![];
+        let chunk = make_chunk(&[], &[], &["hello", "world"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_conflict_context_not_found() {
+        let original: Vec<String> = vec!["aaa", "bbb"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["zzz"], &["bbb"], &["BBB"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]);
+        assert!(matches!(result, Err(ZenpatchError::PatchConflict(_))));
+    }
+
+    #[test]
+    fn test_ambiguous_patch_repeated_context() {
+        let original: Vec<String> = vec!["aaa", "bbb", "aaa", "bbb"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["aaa"], &["bbb"], &["BBB"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]);
+        assert!(matches!(result, Err(ZenpatchError::AmbiguousPatch(_))));
+    }
+
+    #[test]
+    fn test_multiple_chunks_non_overlapping() {
+        let original: Vec<String> = vec!["aaa", "bbb", "ccc", "ddd", "eee"]
+            .into_iter().map(String::from).collect();
+        let chunk1 = make_chunk(&["aaa"], &["bbb"], &["BBB"], &[], 0);
+        let chunk2 = make_chunk(&["ddd"], &["eee"], &["EEE"], &[], 3);
+        let result = apply_patch_backtracking(&original, &[chunk1, chunk2]).unwrap();
+        assert_eq!(result, vec!["aaa", "BBB", "ccc", "ddd", "EEE"]);
+    }
+
+    #[test]
+    fn test_lenient_mode_whitespace_difference() {
+        let original: Vec<String> = vec!["  aaa", "bbb", "ccc"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["aaa"], &["bbb"], &["BBB"], &["ccc"], 0);
+        let result = apply_patch_backtracking_mode(
+            &original, &[chunk], WhitespaceMode::Lenient,
+        ).unwrap();
+        assert_eq!(result, vec!["  aaa", "BBB", "ccc"]);
+    }
+
+    #[test]
+    fn test_super_lenient_mode_fancy_quotes() {
+        let original: Vec<String> = vec!["say \"hello\"", "next"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(
+            &["say \u{201C}hello\u{201D}"],
+            &["next"],
+            &["NEXT"],
+            &[],
+            0,
+        );
+        let result = apply_patch_backtracking_mode(
+            &original, &[chunk], WhitespaceMode::SuperLenient,
+        ).unwrap();
+        assert_eq!(result, vec!["say \"hello\"", "NEXT"]);
+    }
+
+    #[test]
+    fn test_multiple_insertions_empty_file() {
+        let original: Vec<String> = vec![];
+        let chunk1 = make_chunk(&[], &[], &["line1"], &[], 0);
+        let chunk2 = make_chunk(&[], &[], &["line2"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk1, chunk2]).unwrap();
+        assert_eq!(result, vec!["line1", "line2"]);
+    }
+
+    #[test]
+    fn test_deletion_at_file_start() {
+        let original: Vec<String> = vec!["aaa", "bbb", "ccc"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&[], &["aaa"], &[], &["bbb"], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["bbb", "ccc"]);
+    }
+
+    #[test]
+    fn test_deletion_at_file_end() {
+        let original: Vec<String> = vec!["aaa", "bbb", "ccc"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&["bbb"], &["ccc"], &[], &[], 1);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn test_replace_entire_file() {
+        let original: Vec<String> = vec!["old"]
+            .into_iter().map(String::from).collect();
+        let chunk = make_chunk(&[], &["old"], &["new"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["new"]);
+    }
+
+    // ── change_context constraint tests ──
+
+    #[test]
+    fn test_change_context_narrows_repeated_pattern() {
+        // File has two identical "marker" / "target" blocks.
+        // Without change_context both would match → ambiguous.
+        // With change_context pointing to "class Bar", only the second matches.
+        let original: Vec<String> = vec![
+            "class Foo:",
+            "  marker",
+            "  target",
+            "class Bar:",
+            "  marker",
+            "  target",
+        ].into_iter().map(String::from).collect();
+
+        let mut chunk = make_chunk(&["  marker"], &["  target"], &["  REPLACED"], &[], 0);
+        chunk.change_context = Some("class Bar:".to_string());
+
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec![
+            "class Foo:",
+            "  marker",
+            "  target",
+            "class Bar:",
+            "  marker",
+            "  REPLACED",
+        ]);
+    }
+
+    #[test]
+    fn test_change_context_not_found_is_conflict() {
+        let original: Vec<String> = vec!["aaa", "bbb", "ccc"]
+            .into_iter().map(String::from).collect();
+        let mut chunk = make_chunk(&["aaa"], &["bbb"], &["BBB"], &[], 0);
+        chunk.change_context = Some("nonexistent".to_string());
+
+        let result = apply_patch_backtracking(&original, &[chunk]);
+        assert!(matches!(result, Err(ZenpatchError::PatchConflict(_))));
+    }
+
+    // ── is_end_of_file constraint tests ──
+
+    #[test]
+    fn test_is_end_of_file_constrains_to_end() {
+        // File has "marker" / "target" appearing twice.
+        // is_end_of_file should force matching only the one at the end.
+        let original: Vec<String> = vec![
+            "marker",
+            "target",
+            "middle",
+            "marker",
+            "target",
+        ].into_iter().map(String::from).collect();
+
+        let mut chunk = make_chunk(&["marker"], &["target"], &["REPLACED"], &[], 0);
+        chunk.is_end_of_file = true;
+
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec![
+            "marker",
+            "target",
+            "middle",
+            "marker",
+            "REPLACED",
+        ]);
+    }
+
+    #[test]
+    fn test_is_end_of_file_insertion_at_end() {
+        let original: Vec<String> = vec!["first", "last"]
+            .into_iter().map(String::from).collect();
+
+        let mut chunk = make_chunk(&["last"], &[], &["appended"], &[], 0);
+        chunk.is_end_of_file = true;
+
+        let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
+        assert_eq!(result, vec!["first", "last", "appended"]);
     }
 }

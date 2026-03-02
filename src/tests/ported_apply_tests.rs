@@ -99,3 +99,119 @@ fn test_patch_windows_style_newlines() {
     // The `apply` function joins with `\n`, so it normalizes newlines.
     assert_eq!(result_vfs.get("test.txt").unwrap(), "Line 1\nModified Line 2\nLine 3");
 }
+
+// ── Whitespace fallback tests (Strict → Lenient) ──
+
+#[test]
+fn test_whitespace_fallback_extra_leading_spaces() {
+    // File has extra leading spaces; patch context doesn't.
+    // Strict fails, lenient should succeed.
+    let vfs = vfs_from_str("ws.txt", "  Line 1\n  Line 2\n  Line 3");
+    let patch = "*** Begin Patch\n*** Update File: ws.txt\n@@\n Line 1\n-Line 2\n+Modified Line 2\n Line 3\n*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(result_vfs.get("ws.txt").unwrap(), "  Line 1\nModified Line 2\n  Line 3");
+}
+
+#[test]
+fn test_whitespace_fallback_tabs_vs_spaces() {
+    // File uses tabs, patch uses spaces — strict fails, lenient succeeds.
+    let vfs = vfs_from_str("tabs.txt", "\tLine 1\n\tLine 2\n\tLine 3");
+    let patch = "*** Begin Patch\n*** Update File: tabs.txt\n@@\n Line 1\n-Line 2\n+Modified Line 2\n Line 3\n*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(result_vfs.get("tabs.txt").unwrap(), "\tLine 1\nModified Line 2\n\tLine 3");
+}
+
+#[test]
+fn test_whitespace_fallback_mixed_indentation() {
+    // File has inconsistent whitespace (some lines tabs, some spaces).
+    let vfs = vfs_from_str("mixed.txt", "    alpha\n\tbeta\n    gamma");
+    let patch = "*** Begin Patch\n*** Update File: mixed.txt\n@@\n alpha\n-beta\n+BETA\n gamma\n*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(result_vfs.get("mixed.txt").unwrap(), "    alpha\nBETA\n    gamma");
+}
+
+// ── Multi-file interaction tests ──
+
+#[test]
+fn test_patch_updates_two_files() {
+    let mut vfs = Vfs::new();
+    vfs.insert("a.txt".to_string(), "line1\nline2".to_string());
+    vfs.insert("b.txt".to_string(), "foo\nbar".to_string());
+    let patch = "*** Begin Patch\n\
+*** Update File: a.txt\n@@\n line1\n-line2\n+LINE2\n\
+*** Update File: b.txt\n@@\n foo\n-bar\n+BAR\n\
+*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(result_vfs.get("a.txt").unwrap(), "line1\nLINE2");
+    assert_eq!(result_vfs.get("b.txt").unwrap(), "foo\nBAR");
+}
+
+#[test]
+fn test_patch_adds_and_updates_in_one_patch() {
+    let vfs = vfs_from_str("existing.txt", "aaa\nbbb");
+    let patch = "*** Begin Patch\n\
+*** Add File: new.txt\n+hello\n+world\n\
+*** Update File: existing.txt\n@@\n aaa\n-bbb\n+BBB\n\
+*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(result_vfs.get("new.txt").unwrap(), "hello\nworld");
+    assert_eq!(result_vfs.get("existing.txt").unwrap(), "aaa\nBBB");
+}
+
+#[test]
+fn test_update_file_not_in_vfs_returns_file_not_found() {
+    let vfs = Vfs::new();
+    let patch = "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch";
+    let result = apply(patch, &vfs);
+    assert!(matches!(result.unwrap_err(), ZenpatchError::FileNotFound(p) if p == "missing.txt"));
+}
+
+#[test]
+fn test_duplicate_add_returns_file_exists() {
+    let vfs = vfs_from_str("dup.txt", "content");
+    let patch = "*** Begin Patch\n*** Add File: dup.txt\n+new content\n*** End Patch";
+    let result = apply(patch, &vfs);
+    assert!(matches!(result.unwrap_err(), ZenpatchError::FileExists(p) if p == "dup.txt"));
+}
+
+// ── @@ header disambiguation tests ──
+
+#[test]
+fn test_at_header_disambiguates_repeated_context() {
+    // File has two identical blocks under different class headers.
+    let content = "class Foo:\n  def run(self):\n    pass\nclass Bar:\n  def run(self):\n    pass";
+    let vfs = vfs_from_str("code.py", content);
+    let patch = "*** Begin Patch\n*** Update File: code.py\n@@ class Bar:\n def run(self):\n-    pass\n+    return 42\n*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(
+        result_vfs.get("code.py").unwrap(),
+        "class Foo:\n  def run(self):\n    pass\nclass Bar:\n  def run(self):\n    return 42"
+    );
+}
+
+// ── *** End of File anchoring tests ──
+
+#[test]
+fn test_end_of_file_anchors_to_end() {
+    // File has "marker" appearing twice; the End of File marker forces the second one.
+    let content = "marker\ntarget\nmiddle\nmarker\ntarget";
+    let vfs = vfs_from_str("eof.txt", content);
+    let patch = "*** Begin Patch\n*** Update File: eof.txt\n@@\n marker\n-target\n+REPLACED\n*** End of File\n*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(
+        result_vfs.get("eof.txt").unwrap(),
+        "marker\ntarget\nmiddle\nmarker\nREPLACED"
+    );
+}
+
+#[test]
+fn test_end_of_file_append() {
+    let content = "first\nlast";
+    let vfs = vfs_from_str("append.txt", content);
+    let patch = "*** Begin Patch\n*** Update File: append.txt\n@@\n last\n+appended line\n*** End of File\n*** End Patch";
+    let result_vfs = apply(patch, &vfs).unwrap();
+    assert_eq!(
+        result_vfs.get("append.txt").unwrap(),
+        "first\nlast\nappended line"
+    );
+}
