@@ -57,6 +57,34 @@ fn match_line(a: &str, b: &str, mode: WhitespaceMode) -> bool {
     }
 }
 
+/// Builds a precise message when no application sequence exists, so the caller (and any LLM
+/// reading the error) can fix the patch instead of guessing. The dominant failure is a context
+/// (` `) or deletion (`-`) line that does not exist in the file at all — almost always a line
+/// the patch author invented or mistyped — so we name the FIRST such line verbatim. If every
+/// such line does exist individually but not as a consecutive block, the patch has an ordering /
+/// extra-line problem, which we say instead.
+fn diagnose_conflict(original_lines: &[String], chunks: &[Chunk], mode: WhitespaceMode) -> String {
+    for chunk in chunks {
+        for (line_type, content) in &chunk.lines {
+            if matches!(line_type, LineType::Context | LineType::Deletion) {
+                let exists = original_lines.iter().any(|l| match_line(l, content, mode));
+                if !exists {
+                    return format!(
+                        "this context/deleted line does not exist in the file (it was likely \
+                         invented, mistyped, or has wrong whitespace — copy lines verbatim from \
+                         the file): \"{}\"",
+                        content.trim_end()
+                    );
+                }
+            }
+        }
+    }
+    "the patch's context/deleted lines all exist in the file but not as one consecutive block — \
+     a line is out of order, duplicated, or there is an extra line inserted between context lines; \
+     re-copy a contiguous run of real lines around the change"
+        .to_string()
+}
+
 /// Applies patch chunks using strict or lenient whitespace matching.
 /// Wrapper that defaults to strict mode.
 pub fn apply_patch_backtracking(
@@ -86,9 +114,11 @@ pub fn apply_patch_backtracking_mode(
     backtrack_with_mode(&original_lines.to_vec(), chunks, &mut state, &mut current_path, mode);
 
     if state.solution_count == 0 {
-        return Err(ZenpatchError::PatchConflict(
-            "No valid patch application sequence found - please fix the patch include more context".to_string(),
-        ));
+        return Err(ZenpatchError::PatchConflict(diagnose_conflict(
+            original_lines,
+            chunks,
+            mode,
+        )));
     }
     if state.solution_count > 1 {
         return Err(ZenpatchError::AmbiguousPatch(

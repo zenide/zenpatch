@@ -1,6 +1,6 @@
 [package]
 name = "zenpatch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "A robust library for applying text-based patches, designed for AI coding agents with backtracking algorithm"

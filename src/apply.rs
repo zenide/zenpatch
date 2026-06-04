@@ -44,6 +44,7 @@ pub fn apply(
                 );
 
                 // If it fails with a conflict or ambiguity, retry with lenient whitespace matching.
+                // Errors are tagged with the file path so multi-file patches report WHICH file failed.
                 let applied_lines = match result {
                     Err(crate::error::ZenpatchError::PatchConflict(_))
                     | Err(crate::error::ZenpatchError::AmbiguousPatch(_)) => {
@@ -51,10 +52,11 @@ pub fn apply(
                             &original_lines,
                             &action.chunks,
                             crate::applier::whitespace_mode::WhitespaceMode::Lenient,
-                        )?
+                        )
+                        .map_err(|e| e.with_path(&action.path))?
                     }
                     Ok(lines) => lines,
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.with_path(&action.path)),
                 };
                 let updated_content = applied_lines.join("\n");
 
@@ -97,7 +99,10 @@ pub fn apply(
                     new_vfs.remove(&action.path);
                 } else {
                     return std::result::Result::Err(crate::error::ZenpatchError::PatchConflict(
-                        "Content to delete does not match original content.".to_string(),
+                        format!(
+                            "in {}: content to delete does not match the file's content",
+                            action.path
+                        ),
                     ));
                 }
             }
@@ -259,9 +264,25 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             crate::error::ZenpatchError::PatchConflict(msg) => {
-                assert!(msg.contains("does not match original content."));
+                assert!(msg.contains("does not match"));
             }
             _ => panic!("Expected PatchConflict error"),
+        }
+    }
+
+    #[test]
+    fn test_update_conflict_names_file_and_offending_line() {
+        // The hunk's context line "ghost" is not in the file: the error must name both the
+        // file and the offending line so the patch can be fixed without guessing.
+        let patch =
+            "*** Begin Patch\n*** Update File: src/a.txt\n@@\n ghost\n-real\n+changed\n*** End Patch";
+        let vfs = vfs_from_str("src/a.txt", "real\nother");
+        match super::apply(patch, &vfs).unwrap_err() {
+            crate::error::ZenpatchError::PatchConflict(msg) => {
+                assert!(msg.contains("src/a.txt"), "should name the file: {msg}");
+                assert!(msg.contains("ghost"), "should quote the offending line: {msg}");
+            }
+            other => panic!("Expected PatchConflict error, got {other:?}"),
         }
     }
 }
