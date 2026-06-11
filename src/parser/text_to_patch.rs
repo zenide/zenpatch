@@ -22,6 +22,28 @@ pub fn text_to_patch(
 ) -> std::result::Result<std::vec::Vec<crate::data::patch_action::PatchAction>, crate::error::ZenpatchError>
 {
     let trimmed_text = text.trim();
+
+    // LLMs routinely omit the Begin/End envelope and start straight with a
+    // file directive. When NEITHER marker is present and the text begins
+    // with a directive, the intent is unambiguous — wrap it implicitly.
+    // Deliberately narrow: if exactly one marker is present the patch is
+    // malformed or truncated (a missing '*** End Patch' after a present
+    // '*** Begin Patch' usually means the generation was cut off), and
+    // auto-repairing it could apply half a patch — keep failing loudly.
+    let implicit_envelope: std::string::String;
+    let trimmed_text = if (trimmed_text.starts_with("*** Update File:")
+        || trimmed_text.starts_with("*** Add File:")
+        || trimmed_text.starts_with("*** Delete File:"))
+        && !trimmed_text.contains("*** Begin Patch")
+        && !trimmed_text.contains("*** End Patch")
+    {
+        implicit_envelope =
+            std::format!("*** Begin Patch\n{trimmed_text}\n*** End Patch");
+        implicit_envelope.as_str()
+    } else {
+        trimmed_text
+    };
+
     let lines: std::vec::Vec<&str> = trimmed_text.lines().collect();
 
     if lines.len() < 2 {
@@ -80,6 +102,38 @@ mod tests {
     use super::text_to_patch;
     use crate::data::action_type::ActionType;
     use crate::data::line_type::LineType;
+
+    /// LLMs often skip the Begin/End envelope — when neither marker is
+    /// present and the text starts with a file directive, it is wrapped
+    /// implicitly.
+    #[test]
+    fn test_implicit_envelope_for_bare_update() {
+        let patch_text = "*** Update File: a.txt\n@@\n ctx\n-old\n+new";
+        let actions = text_to_patch(patch_text).expect("bare update should parse");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].type_, ActionType::Update);
+    }
+
+    #[test]
+    fn test_implicit_envelope_for_bare_add() {
+        let patch_text = "*** Add File: new.txt\n+content";
+        let actions = text_to_patch(patch_text).expect("bare add should parse");
+        assert_eq!(actions[0].type_, ActionType::Add);
+    }
+
+    /// A present Begin without End usually means the generation was cut
+    /// off — auto-closing could apply half a patch, so it must stay loud.
+    #[test]
+    fn test_begin_without_end_still_fails() {
+        let patch_text = "*** Begin Patch\n*** Update File: a.txt\n@@\n ctx\n+new";
+        assert!(text_to_patch(patch_text).is_err());
+    }
+
+    #[test]
+    fn test_end_without_begin_still_fails() {
+        let patch_text = "*** Update File: a.txt\n@@\n ctx\n+new\n*** End Patch";
+        assert!(text_to_patch(patch_text).is_err());
+    }
 
     #[test]
     fn test_text_to_patch_valid_add() {
