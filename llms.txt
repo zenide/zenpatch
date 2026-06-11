@@ -25,6 +25,7 @@ To update an existing file, use the `*** Update File:` directive.
 - **Hunks:** Each change within the file is specified in a hunk starting with `@@`.
 - **Hunk Headers:** A bare `@@` starts a hunk. To disambiguate repeated patterns in large files, add a context string after `@@`: `@@ class MyClass:` or `@@ def my_function():`. The patcher uses this text to locate the nearest matching line and constrains the search to positions after it.
 - **End of File Marker:** Use `*** End of File` after the last line of a hunk to indicate the change must apply at the end of the file. This is useful when context lines appear multiple times and you want to anchor to the final occurrence.
+- **Hunk Order:** List hunks in the order they appear in the file. The patcher tries file order first; when several identical regions are edited, hunk order determines which occurrence each hunk targets.
 - **Line Prefixes:**
     - ` ` (space): A context line, which must match the existing content in the file.
     - `-`: A line to be deleted.

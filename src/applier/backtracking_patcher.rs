@@ -108,8 +108,6 @@ pub fn apply_patch_backtracking_mode(
         .map(|chunk| valid_positions_for_chunk(original_lines, chunk, mode))
         .collect();
 
-    let (mut current_path, mut state) = find_fixed_mappings(chunks, &valid_positions, mode);
-
     // Content class per chunk: identical chunks share a class, so solution
     // keys are invariant under permutations of interchangeable chunks.
     let chunk_classes: Vec<usize> = chunks
@@ -123,14 +121,32 @@ pub fn apply_patch_backtracking_mode(
         })
         .collect();
 
-    let ctx = SearchCtx {
+    // Hunks almost always appear in file order, and for interchangeable
+    // hunks the patch encodes WHICH occurrence each one targets only
+    // through that order. So: try first with positions required to be
+    // non-decreasing in hunk order. This both prunes the search and
+    // legitimately resolves repeated-pattern patches that are ambiguous
+    // without it. Ordered solutions are a subset of unordered ones, so an
+    // ambiguity verdict here is final; only "no solution at all" falls
+    // back to the unordered search (out-of-order hunks).
+    let (mut current_path, mut state) = find_fixed_mappings(chunks, &valid_positions, mode);
+    let ordered_ctx = SearchCtx {
         lines: original_lines,
         chunks,
         valid_positions: &valid_positions,
         chunk_classes: &chunk_classes,
         mode,
+        ordered: true,
     };
-    backtrack_with_mode(&ctx, &mut state, &mut current_path);
+    backtrack_with_mode(&ordered_ctx, &mut state, &mut current_path);
+
+    if state.solution_count == 0 {
+        let (path, st) = find_fixed_mappings(chunks, &valid_positions, mode);
+        current_path = path;
+        state = st;
+        let unordered_ctx = SearchCtx { ordered: false, ..ordered_ctx };
+        backtrack_with_mode(&unordered_ctx, &mut state, &mut current_path);
+    }
 
     if state.solution_count == 0 {
         return Err(ZenpatchError::PatchConflict(diagnose_conflict(
@@ -405,6 +421,9 @@ struct SearchCtx<'a> {
     /// Content class per chunk: index of the first chunk with equal content.
     chunk_classes: &'a [usize],
     mode: WhitespaceMode,
+    /// When set, chunk positions must be non-decreasing in chunk order
+    /// (hunks appear in file order).
+    ordered: bool,
 }
 
 fn backtrack_with_mode(
@@ -412,7 +431,7 @@ fn backtrack_with_mode(
     state: &mut BacktrackingState,
     current_path: &mut Vec<(usize, usize)>,
 ) {
-    let SearchCtx { lines, chunks, valid_positions, chunk_classes, mode } = *ctx;
+    let SearchCtx { lines, chunks, valid_positions, chunk_classes, mode, ordered } = *ctx;
     state.nodes_visited += 1;
     if state.nodes_visited > MAX_BACKTRACK_NODES || state.solution_count > 1 {
         state.solution_count = 2;
@@ -462,6 +481,16 @@ fn backtrack_with_mode(
         }
 
         for &pos in &valid_positions[i] {
+            // File-order constraint, checked against every placement so far
+            // (including pre-committed fixed mappings on either side).
+            if ordered
+                && current_path
+                    .iter()
+                    .any(|&(j, pj)| (j < i && pj > pos) || (j > i && pj < pos))
+            {
+                continue;
+            }
+
             let affected = affected_range(chunk, pos, mode);
             if affected.clone().any(|idx| state.modified_indices.contains(&idx)) {
                 continue;
@@ -786,6 +815,47 @@ mod tests {
         let result = apply_patch_backtracking(&original, &chunks).unwrap();
         assert_eq!(result.len(), 2000);
         assert!(result.iter().all(|l| l != "dup"));
+    }
+
+    // ── ordered-first (file-order) tests ──
+
+    /// Two hunks targeting two identical regions: without the file-order
+    /// constraint the assignment is ambiguous (X/Y could swap). Patch order
+    /// is the only encoding of which occurrence each hunk targets — ordered
+    /// search resolves it.
+    #[test]
+    fn test_file_order_resolves_interchangeable_hunks() {
+        let original: Vec<String> = vec!["marker", "target", "marker", "target"]
+            .into_iter().map(String::from).collect();
+        let chunk1 = make_chunk(&["marker"], &["target"], &["X"], &[], 0);
+        let chunk2 = make_chunk(&["marker"], &["target"], &["Y"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk1, chunk2]).unwrap();
+        assert_eq!(result, vec!["marker", "X", "marker", "Y"]);
+    }
+
+    /// Order does NOT fabricate uniqueness: two hunks over three identical
+    /// regions have several in-order assignments with different results —
+    /// still ambiguous.
+    #[test]
+    fn test_file_order_does_not_mask_real_ambiguity() {
+        let original: Vec<String> = vec!["target", "target", "target"]
+            .into_iter().map(String::from).collect();
+        let chunk1 = make_chunk(&[], &["target"], &["X"], &[], 0);
+        let chunk2 = make_chunk(&[], &["target"], &["Y"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk1, chunk2]);
+        assert!(matches!(result, Err(ZenpatchError::AmbiguousPatch(_))));
+    }
+
+    /// Out-of-order hunks with unique placements still apply via the
+    /// unordered fallback.
+    #[test]
+    fn test_out_of_order_unique_hunks_fall_back_and_apply() {
+        let original: Vec<String> = vec!["aaa", "mid", "zzz"]
+            .into_iter().map(String::from).collect();
+        let chunk1 = make_chunk(&[], &["zzz"], &["ZZZ"], &[], 0);
+        let chunk2 = make_chunk(&[], &["aaa"], &["AAA"], &[], 0);
+        let result = apply_patch_backtracking(&original, &[chunk1, chunk2]).unwrap();
+        assert_eq!(result, vec!["AAA", "mid", "ZZZ"]);
     }
 
     // ── change_context constraint tests ──
