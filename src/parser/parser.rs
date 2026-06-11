@@ -12,6 +12,34 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Pushes a chunk after stripping empty context lines from its edges.
+    ///
+    /// Empty context lines INSIDE a hunk are real file content (a blank line
+    /// whose leading space was stripped) and must match. At the chunk edges
+    /// they are almost always cosmetic separators the LLM added around the
+    /// hunk, and requiring a blank line there would break otherwise-valid
+    /// patches — so the edges are trimmed.
+    fn push_chunk(
+        chunks: &mut std::vec::Vec<crate::data::chunk::Chunk>,
+        mut chunk: crate::data::chunk::Chunk,
+    ) {
+        while std::matches!(
+            chunk.lines.first(),
+            std::option::Option::Some((crate::data::line_type::LineType::Context, c)) if c.is_empty()
+        ) {
+            chunk.lines.remove(0);
+        }
+        while std::matches!(
+            chunk.lines.last(),
+            std::option::Option::Some((crate::data::line_type::LineType::Context, c)) if c.is_empty()
+        ) {
+            chunk.lines.pop();
+        }
+        if !chunk.lines.is_empty() {
+            chunks.push(chunk);
+        }
+    }
+
     /// Creates a new parser for the given patch content.
     pub fn new(patch_content: &str) -> Self {
         let lines = if patch_content.trim().is_empty() {
@@ -68,6 +96,10 @@ impl Parser {
 
        let mut lines = std::vec::Vec::new();
        let mut ins_lines = std::vec::Vec::new();
+       // Bare empty lines are blank lines of the new file whose '+' prefix was
+       // omitted — dropping them would corrupt the added file. Only a trailing
+       // run of them (a separator before the next directive) is not content.
+       let mut trailing_bare_empty: usize = 0;
        while self.index < self.lines.len() && !self.lines[self.index].starts_with("*** ") {
            let line_content = &self.lines[self.index];
            if line_content.starts_with('+') {
@@ -77,8 +109,20 @@ impl Parser {
                    content.clone(),
                ));
                ins_lines.push(content);
+               trailing_bare_empty = 0;
+           } else if line_content.is_empty() {
+               lines.push((
+                   crate::data::line_type::LineType::Insertion,
+                   std::string::String::new(),
+               ));
+               ins_lines.push(std::string::String::new());
+               trailing_bare_empty += 1;
            }
            self.index += 1;
+       }
+       for _ in 0..trailing_bare_empty {
+           lines.pop();
+           ins_lines.pop();
        }
 
        let chunk = crate::data::chunk::Chunk {
@@ -132,15 +176,18 @@ impl Parser {
             }
 
             if line == "*** End of File" {
+                // Anchor the current chunk to the file tail, but KEEP parsing:
+                // breaking here would silently discard any further @@ chunks in
+                // this Update section while the patch still "succeeds".
                 current_chunk.is_end_of_file = true;
+                Self::push_chunk(&mut chunks, current_chunk);
+                current_chunk = crate::data::chunk::Chunk::new();
                 self.index += 1;
-                break;
+                continue;
             }
 
             if line.starts_with("@@") {
-                if !current_chunk.lines.is_empty() {
-                    chunks.push(current_chunk);
-                }
+                Self::push_chunk(&mut chunks, current_chunk);
                 current_chunk = crate::data::chunk::Chunk::new();
                 // Extract change_context from "@@ <text>" header
                 let trimmed = &line[2..];
@@ -154,7 +201,16 @@ impl Parser {
                 continue;
             }
 
-            let (line_type, content) = if line.starts_with(' ') {
+            let (line_type, content) = if line.is_empty() {
+                // An empty line in a hunk is an empty CONTEXT line whose lone
+                // leading space was stripped (editors and LLMs trim trailing
+                // whitespace) — dropping it would make the hunk's context
+                // non-consecutive and the patch unappliable.
+                (
+                    crate::data::line_type::LineType::Context,
+                    std::string::String::new(),
+                )
+            } else if line.starts_with(' ') {
                 (
                     crate::data::line_type::LineType::Context,
                     line[1..].to_string(),
@@ -178,9 +234,7 @@ impl Parser {
             self.index += 1;
         }
 
-        if !current_chunk.lines.is_empty() {
-            chunks.push(current_chunk);
-        }
+        Self::push_chunk(&mut chunks, current_chunk);
 
         std::result::Result::Ok(crate::data::patch_action::PatchAction {
             type_: crate::data::action_type::ActionType::Update,

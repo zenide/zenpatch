@@ -96,8 +96,12 @@ fn test_patch_windows_style_newlines() {
     let patch = "*** Begin Patch\n*** Update File: test.txt\n@@\n Line 1\n-Line 2\n+Modified Line 2\n Line 3\n*** End Patch";
 
     let result_vfs = apply(patch, &vfs).unwrap();
-    // The `apply` function joins with `\n`, so it normalizes newlines.
-    assert_eq!(result_vfs.get("test.txt").unwrap(), "Line 1\nModified Line 2\nLine 3");
+    // The file's own CRLF line endings are preserved — a one-line patch must
+    // not rewrite every line ending in the file.
+    assert_eq!(
+        result_vfs.get("test.txt").unwrap(),
+        "Line 1\r\nModified Line 2\r\nLine 3"
+    );
 }
 
 // ── Whitespace fallback tests (Strict → Lenient) ──

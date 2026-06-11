@@ -21,7 +21,22 @@ pub fn text_to_patch(
     text: &str,
 ) -> std::result::Result<std::vec::Vec<crate::data::patch_action::PatchAction>, crate::error::ZenpatchError>
 {
-    let trimmed_text = text.trim();
+    let mut normalized = text.trim().to_string();
+
+    // LLMs routinely wrap the whole patch in a markdown code fence
+    // (```/```diff/```patch). Strip a leading fence line and, if present,
+    // the matching trailing fence line.
+    if normalized.starts_with("```") {
+        let mut lines: std::vec::Vec<&str> = normalized.lines().collect();
+        lines.remove(0);
+        if lines
+            .last()
+            .is_some_and(|l| l.trim() == "```")
+        {
+            lines.pop();
+        }
+        normalized = lines.join("\n").trim().to_string();
+    }
 
     // LLMs routinely omit the Begin/End envelope and start straight with a
     // file directive. When NEITHER marker is present and the text begins
@@ -30,19 +45,16 @@ pub fn text_to_patch(
     // malformed or truncated (a missing '*** End Patch' after a present
     // '*** Begin Patch' usually means the generation was cut off), and
     // auto-repairing it could apply half a patch — keep failing loudly.
-    let implicit_envelope: std::string::String;
-    let trimmed_text = if (trimmed_text.starts_with("*** Update File:")
-        || trimmed_text.starts_with("*** Add File:")
-        || trimmed_text.starts_with("*** Delete File:"))
-        && !trimmed_text.contains("*** Begin Patch")
-        && !trimmed_text.contains("*** End Patch")
+    if (normalized.starts_with("*** Update File:")
+        || normalized.starts_with("*** Add File:")
+        || normalized.starts_with("*** Delete File:"))
+        && !normalized.contains("*** Begin Patch")
+        && !normalized.contains("*** End Patch")
     {
-        implicit_envelope =
-            std::format!("*** Begin Patch\n{trimmed_text}\n*** End Patch");
-        implicit_envelope.as_str()
-    } else {
-        trimmed_text
-    };
+        normalized = std::format!("*** Begin Patch\n{normalized}\n*** End Patch");
+    }
+
+    let trimmed_text = normalized.as_str();
 
     let lines: std::vec::Vec<&str> = trimmed_text.lines().collect();
 
@@ -119,6 +131,24 @@ mod tests {
         let patch_text = "*** Add File: new.txt\n+content";
         let actions = text_to_patch(patch_text).expect("bare add should parse");
         assert_eq!(actions[0].type_, ActionType::Add);
+    }
+
+    /// LLMs routinely wrap the whole patch in a markdown code fence.
+    #[test]
+    fn test_markdown_fenced_patch_is_unwrapped() {
+        let patch_text =
+            "```diff\n*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n```";
+        let actions = text_to_patch(patch_text).expect("fenced patch should parse");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].type_, ActionType::Add);
+    }
+
+    /// Fence stripping composes with the implicit envelope.
+    #[test]
+    fn test_markdown_fenced_bare_directive_patch() {
+        let patch_text = "```\n*** Update File: a.txt\n@@\n-a\n+b\n```";
+        let actions = text_to_patch(patch_text).expect("fenced bare patch should parse");
+        assert_eq!(actions[0].type_, ActionType::Update);
     }
 
     /// A present Begin without End usually means the generation was cut

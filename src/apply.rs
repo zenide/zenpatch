@@ -58,7 +58,16 @@ pub fn apply(
                     Ok(lines) => lines,
                     Err(e) => return Err(e.with_path(&action.path)),
                 };
-                let updated_content = applied_lines.join("\n");
+                // Re-join with the file's own dominant line ending and restore its
+                // trailing newline: a one-line patch must not rewrite every line
+                // ending in a CRLF file or strip the final newline.
+                let crlf_count = original_content.matches("\r\n").count();
+                let lf_only_count = original_content.matches('\n').count() - crlf_count;
+                let eol = if crlf_count > lf_only_count { "\r\n" } else { "\n" };
+                let mut updated_content = applied_lines.join(eol);
+                if original_content.ends_with('\n') && !updated_content.is_empty() {
+                    updated_content.push_str(eol);
+                }
 
                 if let Some(new_path) = &action.new_path {
                     // Handle rename
@@ -268,6 +277,87 @@ mod tests {
             }
             _ => panic!("Expected PatchConflict error"),
         }
+    }
+
+    #[test]
+    fn test_update_preserves_trailing_newline() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+b\n*** End Patch";
+        let vfs = vfs_from_str("a.txt", "a\nz\n");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(result_vfs.get("a.txt").unwrap(), "b\nz\n");
+    }
+
+    #[test]
+    fn test_update_keeps_absent_trailing_newline_absent() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+b\n*** End Patch";
+        let vfs = vfs_from_str("a.txt", "a\nz");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(result_vfs.get("a.txt").unwrap(), "b\nz");
+    }
+
+    #[test]
+    fn test_update_preserves_crlf_and_trailing_newline() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+b\n*** End Patch";
+        let vfs = vfs_from_str("a.txt", "a\r\nz\r\n");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(result_vfs.get("a.txt").unwrap(), "b\r\nz\r\n");
+    }
+
+    /// A blank context line inside a hunk (its lone ' ' prefix stripped by the
+    /// LLM or an editor) must still match a blank line in the file.
+    #[test]
+    fn test_update_blank_context_line_inside_hunk() {
+        let patch = "*** Begin Patch\n*** Update File: f.py\n@@\n fn_a = 1\n\n-fn_b = 2\n+fn_b = 99\n*** End Patch";
+        let vfs = vfs_from_str("f.py", "fn_a = 1\n\nfn_b = 2");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(result_vfs.get("f.py").unwrap(), "fn_a = 1\n\nfn_b = 99");
+    }
+
+    /// Cosmetic blank lines at the hunk edges (after @@, before End Patch)
+    /// must not be required to exist in the file.
+    #[test]
+    fn test_update_blank_separator_lines_at_hunk_edges_ignored() {
+        let patch = "*** Begin Patch\n*** Update File: f.txt\n@@\n\n a\n-b\n+B\n\n*** End Patch";
+        let vfs = vfs_from_str("f.txt", "a\nb");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(result_vfs.get("f.txt").unwrap(), "a\nB");
+    }
+
+    /// Chunks after an '*** End of File' marker must be applied, not
+    /// silently discarded while the patch reports success.
+    #[test]
+    fn test_update_chunk_after_end_of_file_is_not_dropped() {
+        let patch = "*** Begin Patch\n*** Update File: f.txt\n@@\n gamma\n-omega\n+OMEGA\n*** End of File\n@@\n-alpha\n+ALPHA\n*** End Patch";
+        let vfs = vfs_from_str("f.txt", "alpha\nbeta\ngamma\nomega");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(
+            result_vfs.get("f.txt").unwrap(),
+            "ALPHA\nbeta\ngamma\nOMEGA"
+        );
+    }
+
+    /// Bare blank lines inside Add File content are blank lines of the new
+    /// file (the '+' was omitted) — they must be kept, not dropped.
+    #[test]
+    fn test_add_file_bare_blank_line_is_content() {
+        let patch = "*** Begin Patch\n*** Add File: m.py\n+def a():\n+    pass\n\n+def b():\n+    pass\n*** End Patch";
+        let vfs = Vfs::new();
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(
+            result_vfs.get("m.py").unwrap(),
+            "def a():\n    pass\n\ndef b():\n    pass"
+        );
+    }
+
+    /// A trailing run of bare blank lines before the next directive is a
+    /// separator, not content of the added file.
+    #[test]
+    fn test_add_file_trailing_bare_blank_separator_trimmed() {
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+x\n\n*** Delete File: b.txt\n-y\n*** End Patch";
+        let vfs = vfs_from_str("b.txt", "y");
+        let result_vfs = super::apply(patch, &vfs).unwrap();
+        assert_eq!(result_vfs.get("a.txt").unwrap(), "x");
+        assert!(result_vfs.get("b.txt").is_none());
     }
 
     #[test]
