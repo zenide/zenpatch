@@ -9,13 +9,6 @@ use crate::applier::whitespace_mode::WhitespaceMode;
 use crate::data::chunk::Chunk;
 use crate::data::line_type::LineType;
 use crate::error::ZenpatchError;
-use std::cell::Cell;
-use std::collections::HashSet;
-
-thread_local! {
-    /// Counts how many recursive backtrack calls have been made in this run.
-    static NODE_COUNT: Cell<usize> = Cell::new(0);
-}
 
 /// Maximum allowed backtracking nodes before giving up as "ambiguous".
 const MAX_BACKTRACK_NODES: usize = 100_000;
@@ -107,11 +100,37 @@ pub fn apply_patch_backtracking_mode(
         return Ok(result);
     }
 
-    let (fixed_path, mut state) = find_fixed_mappings(original_lines, chunks, mode);
-    let mut current_path = fixed_path;
+    // The original file never changes during the search, so each chunk's
+    // candidate positions (context match + deletion content check) are
+    // computed exactly once here instead of at every search node.
+    let valid_positions: Vec<Vec<usize>> = chunks
+        .iter()
+        .map(|chunk| valid_positions_for_chunk(original_lines, chunk, mode))
+        .collect();
 
-    NODE_COUNT.with(|cnt| cnt.set(0));
-    backtrack_with_mode(&original_lines.to_vec(), chunks, &mut state, &mut current_path, mode);
+    let (mut current_path, mut state) = find_fixed_mappings(chunks, &valid_positions, mode);
+
+    // Content class per chunk: identical chunks share a class, so solution
+    // keys are invariant under permutations of interchangeable chunks.
+    let chunk_classes: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            chunks[..i]
+                .iter()
+                .position(|earlier| earlier == chunk)
+                .unwrap_or(i)
+        })
+        .collect();
+
+    let ctx = SearchCtx {
+        lines: original_lines,
+        chunks,
+        valid_positions: &valid_positions,
+        chunk_classes: &chunk_classes,
+        mode,
+    };
+    backtrack_with_mode(&ctx, &mut state, &mut current_path);
 
     if state.solution_count == 0 {
         return Err(ZenpatchError::PatchConflict(diagnose_conflict(
@@ -126,10 +145,70 @@ pub fn apply_patch_backtracking_mode(
         ));
     }
 
-    let solution = state.solution_path.clone().expect("solution_path must be set");
-    let mut ordered = solution.clone();
+    Ok(state
+        .first_solution_result
+        .expect("first_solution_result must be set"))
+}
+
+/// Length of the chunk's leading context run, adjusted for the
+/// duplicated-line case where the last context line equals the first
+/// deleted line (the two refer to the same file line).
+fn adjusted_pre_len(chunk: &Chunk, mode: WhitespaceMode) -> usize {
+    let mut pre_len = 0;
+    for (lt, _) in chunk.lines.iter() {
+        if *lt == LineType::Context {
+            pre_len += 1;
+        } else {
+            break;
+        }
+    }
+    if pre_len > 0 && !chunk.del_lines.is_empty() {
+        let last_ctx = &chunk.lines[pre_len - 1].1;
+        if let Some((LineType::Deletion, del)) = chunk.lines.get(pre_len) {
+            if match_line(last_ctx, del, mode) {
+                return pre_len - 1;
+            }
+        }
+    }
+    pre_len
+}
+
+/// Candidate positions for a chunk: context matches whose deletion block
+/// also matches the file content at that offset.
+fn valid_positions_for_chunk(
+    lines: &[String],
+    chunk: &Chunk,
+    mode: WhitespaceMode,
+) -> Vec<usize> {
+    let adj_pre = adjusted_pre_len(chunk, mode);
+    find_match_positions(lines, chunk, mode)
+        .into_iter()
+        .filter(|&pos| {
+            chunk.del_lines.iter().enumerate().all(|(j, del_line)| {
+                let idx = pos + adj_pre + j;
+                idx < lines.len() && match_line(&lines[idx], del_line, mode)
+            })
+        })
+        .collect()
+}
+
+/// The original-file index range consumed (deleted) by a chunk matched at `pos`.
+fn affected_range(chunk: &Chunk, pos: usize, mode: WhitespaceMode) -> std::ops::Range<usize> {
+    let start = pos + adjusted_pre_len(chunk, mode);
+    start..start + chunk.del_lines.len()
+}
+
+/// Applies a complete (chunk index, original position) mapping to the
+/// original lines, in ascending position order with a running offset.
+fn materialize_solution(
+    lines: &[String],
+    chunks: &[Chunk],
+    mapping: &[(usize, usize)],
+    mode: WhitespaceMode,
+) -> Vec<String> {
+    let mut ordered: Vec<(usize, usize)> = mapping.to_vec();
     ordered.sort_by_key(|&(_, pos)| pos);
-    let mut result = original_lines.to_vec();
+    let mut result = lines.to_vec();
     let mut delta: isize = 0;
     for (chunk_idx, orig_pos) in ordered {
         let chunk = &chunks[chunk_idx];
@@ -141,68 +220,26 @@ pub fn apply_patch_backtracking_mode(
         result = apply_chunk(&result, chunk, pos, mode);
         delta += chunk.ins_lines.len() as isize - chunk.del_lines.len() as isize;
     }
-    Ok(result)
+    result
 }
 
-/// Finds fixed mappings based on uniquely identifying context lines in both patch and file.
+/// Pre-commits every chunk that has exactly one valid, non-overlapping
+/// position — these need no search at all.
 fn find_fixed_mappings(
-    original_lines: &[String],
     chunks: &[Chunk],
+    valid_positions: &[Vec<usize>],
     mode: WhitespaceMode,
 ) -> (Vec<(usize, usize)>, BacktrackingState) {
     let mut result_path = Vec::new();
     let mut state = BacktrackingState::new();
-    let mut used_indices = HashSet::new();
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        let positions = find_match_positions(&original_lines.to_vec(), chunk, mode);
-        let mut valid_positions = vec![];
-
-        for &pos in &positions {
-            // Check deletion match
-            let mut pre_len = 0;
-            for (lt, _) in chunk.lines.iter() {
-                if *lt == LineType::Context {
-                    pre_len += 1;
-                } else {
-                    break;
-                }
-            }
-
-            let mut adj_pre = pre_len;
-            if pre_len > 0 && !chunk.del_lines.is_empty() {
-                if let (LineType::Context, ctx) = &chunk.lines[pre_len - 1] {
-                    if let Some((LineType::Deletion, del)) = chunk.lines.get(pre_len) {
-                        if match_line(ctx, del, mode) {
-                            adj_pre = adj_pre.saturating_sub(1);
-                        }
-                    }
-                }
-            }
-
-            let mut content_match = true;
-            for (j, del_line) in chunk.del_lines.iter().enumerate() {
-                let idx = pos + adj_pre + j;
-                if idx >= original_lines.len() || !match_line(&original_lines[idx], del_line, mode) {
-                    content_match = false;
-                    break;
-                }
-            }
-
-            if content_match {
-                valid_positions.push(pos);
-            }
-        }
-
-        // Only allow fixed mapping if there is exactly one valid position and it does not overlap
-        if valid_positions.len() == 1 {
-            let pos = valid_positions[0];
-            let affected = get_affected_indices(chunk, pos, mode);
-            if affected.iter().all(|idx| !used_indices.contains(idx)) {
+        if let [pos] = valid_positions[chunk_idx][..] {
+            let affected = affected_range(chunk, pos, mode);
+            if affected.clone().all(|idx| !state.modified_indices.contains(&idx)) {
                 state.applied_chunks.insert(chunk_idx);
-                for idx in &affected {
-                    state.modified_indices.insert(*idx);
-                    used_indices.insert(*idx);
+                for idx in affected {
+                    state.modified_indices.insert(idx);
                 }
                 result_path.push((chunk_idx, pos));
             }
@@ -257,7 +294,7 @@ fn apply_chunk_constraints(
 }
 
 fn find_match_positions(
-    lines: &Vec<String>,
+    lines: &[String],
     chunk: &Chunk,
     mode: WhitespaceMode,
 ) -> Vec<usize> {
@@ -303,7 +340,7 @@ fn find_match_positions(
     // collect trailing context (post-context) for potential disambiguation
     let post_context: Vec<String> = {
         let mut ctx: Vec<String> = Vec::new();
-        for &(ref lt, ref content) in chunk.lines.iter().rev() {
+        for (lt, content) in chunk.lines.iter().rev() {
             if *lt == LineType::Context {
                 if !content.trim().is_empty() {
                     ctx.push(content.clone());
@@ -346,55 +383,9 @@ fn find_match_positions(
     apply_chunk_constraints(positions, lines, chunk, mode)
 }
 
-fn get_affected_indices(chunk: &Chunk, pos: usize, mode: WhitespaceMode) -> Vec<usize> {
-    let mut indices: Vec<usize> = Vec::new();
-    let mut pre_len = 0;
-    for (lt, _) in chunk.lines.iter() {
-        if *lt == LineType::Context {
-            pre_len += 1;
-        } else {
-            break;
-        }
-    }
-
-    let mut adj_pre = pre_len;
-    if pre_len > 0 && !chunk.del_lines.is_empty() {
-        if let (LineType::Context, ctx) = &chunk.lines[pre_len - 1] {
-            if let Some((LineType::Deletion, del)) = chunk.lines.get(pre_len) {
-                if match_line(ctx, del, mode) {
-                    adj_pre = adj_pre.saturating_sub(1);
-                }
-            }
-        }
-    }
-
-    for idx in pos + adj_pre..pos + adj_pre + chunk.del_lines.len() {
-        indices.push(idx);
-    }
-    indices
-}
-
-fn apply_chunk(lines: &Vec<String>, chunk: &Chunk, pos: usize, mode: WhitespaceMode) -> Vec<String> {
+fn apply_chunk(lines: &[String], chunk: &Chunk, pos: usize, mode: WhitespaceMode) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
-    let mut pre_len = 0;
-    for (lt, _) in chunk.lines.iter() {
-        if *lt == LineType::Context {
-            pre_len += 1;
-        } else {
-            break;
-        }
-    }
-
-    let mut adj_pre = pre_len;
-    if pre_len > 0 && !chunk.del_lines.is_empty() {
-        if let (LineType::Context, ctx) = &chunk.lines[pre_len - 1] {
-            if let Some((LineType::Deletion, del)) = chunk.lines.get(pre_len) {
-                if match_line(ctx, del, mode) {
-                    adj_pre = adj_pre.saturating_sub(1);
-                }
-            }
-        }
-    }
+    let adj_pre = adjusted_pre_len(chunk, mode);
 
     let start_copy = (pos + adj_pre).min(lines.len());
     result.extend_from_slice(&lines[..start_copy]);
@@ -405,53 +396,53 @@ fn apply_chunk(lines: &Vec<String>, chunk: &Chunk, pos: usize, mode: WhitespaceM
     result
 }
 
+/// Immutable inputs of the backtracking search, fixed for its whole duration.
+struct SearchCtx<'a> {
+    lines: &'a [String],
+    chunks: &'a [Chunk],
+    /// Pre-computed candidate positions per chunk (same indexing as `chunks`).
+    valid_positions: &'a [Vec<usize>],
+    /// Content class per chunk: index of the first chunk with equal content.
+    chunk_classes: &'a [usize],
+    mode: WhitespaceMode,
+}
+
 fn backtrack_with_mode(
-    lines: &Vec<String>,
-    chunks: &[Chunk],
+    ctx: &SearchCtx<'_>,
     state: &mut BacktrackingState,
     current_path: &mut Vec<(usize, usize)>,
-    mode: WhitespaceMode,
 ) {
-    let over = NODE_COUNT.with(|c| {
-        let n = c.get().saturating_add(1);
-        c.set(n);
-        n > MAX_BACKTRACK_NODES
-    });
-    if over || state.solution_count > 1 {
+    let SearchCtx { lines, chunks, valid_positions, chunk_classes, mode } = *ctx;
+    state.nodes_visited += 1;
+    if state.nodes_visited > MAX_BACKTRACK_NODES || state.solution_count > 1 {
         state.solution_count = 2;
         return;
     }
 
     if current_path.len() == chunks.len() {
-        let mut candidate = lines.clone();
-        let mut delta: isize = 0;
-        let mut mapping = current_path.clone();
-        mapping.sort_by_key(|&(_, pos)| pos);
-        for (chunk_idx, orig_pos) in mapping.iter() {
-            let chunk = &chunks[*chunk_idx];
-            let pos = if delta >= 0 {
-                (*orig_pos as isize + delta) as usize
-            } else {
-                orig_pos.saturating_sub((-delta) as usize)
-            };
-            candidate = apply_chunk(&candidate, chunk, pos, mode);
-            delta += chunk.ins_lines.len() as isize - chunk.del_lines.len() as isize;
-        }
-
-        if state.solution_count == 0 {
-            state.solution_count = 1;
-            state.first_solution_result = Some(candidate.clone());
-            state.solution_path = Some(current_path.clone());
+        // Different application orders can produce the same file; only a
+        // DIFFERENT resulting file counts as a second (ambiguous) solution.
+        // Mappings with equal (position, chunk content) keys are identical
+        // by construction — dedup them without materializing the file.
+        let mut key: Vec<(usize, usize)> = current_path
+            .iter()
+            .map(|&(chunk_idx, pos)| (pos, chunk_classes[chunk_idx]))
+            .collect();
+        key.sort_unstable();
+        if state.first_solution_key.as_ref() == Some(&key) {
             return;
         }
-
-        if let Some(first) = &state.first_solution_result {
-            if *first == candidate {
-                return;
+        let candidate = materialize_solution(lines, chunks, current_path, mode);
+        match &state.first_solution_result {
+            None => {
+                state.solution_count = 1;
+                state.first_solution_result = Some(candidate);
+                state.solution_path = Some(current_path.clone());
+                state.first_solution_key = Some(key);
             }
+            Some(first) if *first == candidate => {}
+            Some(_) => state.solution_count = 2,
         }
-
-        state.solution_count = 2;
         return;
     }
 
@@ -470,63 +461,41 @@ fn backtrack_with_mode(
             }
         }
 
-        let positions = find_match_positions(lines, chunk, mode);
-        for pos in positions {
-            let mut pre_len = 0;
-            for (lt, _) in chunk.lines.iter() {
-                if *lt == LineType::Context {
-                    pre_len += 1;
-                } else {
-                    break;
-                }
-            }
-            let mut adj_pre = pre_len;
-            if pre_len > 0 && !chunk.del_lines.is_empty() {
-                if let (LineType::Context, ctx) = &chunk.lines[pre_len - 1] {
-                    if let Some((LineType::Deletion, del)) = chunk.lines.get(pre_len) {
-                        if match_line(ctx, del, mode) {
-                            adj_pre = adj_pre.saturating_sub(1);
-                        }
-                    }
-                }
-            }
-
-            let mut content_match = true;
-            for (j, del_line) in chunk.del_lines.iter().enumerate() {
-                let idx = pos + adj_pre + j;
-                if idx >= lines.len() || !match_line(&lines[idx], del_line, mode) {
-                    content_match = false;
-                    break;
-                }
-            }
-            if !content_match {
+        for &pos in &valid_positions[i] {
+            let affected = affected_range(chunk, pos, mode);
+            if affected.clone().any(|idx| state.modified_indices.contains(&idx)) {
                 continue;
             }
 
-            let affected = get_affected_indices(chunk, pos, mode);
-            if affected.iter().any(|idx| state.modified_indices.contains(idx)) {
-                continue;
+            // Do/undo on the ONE shared state instead of cloning it per node.
+            state.applied_chunks.insert(i);
+            for idx in affected.clone() {
+                state.modified_indices.insert(idx);
             }
+            current_path.push((i, pos));
 
-            let mut next_state = state.clone();
-            next_state.applied_chunks.insert(i);
-            for idx in affected.iter().cloned() {
-                next_state.modified_indices.insert(idx);
+            backtrack_with_mode(ctx, state, current_path);
+
+            current_path.pop();
+            for idx in affected {
+                state.modified_indices.remove(&idx);
             }
+            state.applied_chunks.remove(&i);
 
-            let mut next_path = current_path.clone();
-            next_path.push((i, pos));
-            backtrack_with_mode(lines, chunks, &mut next_state, &mut next_path, mode);
-
-            state.solution_count = next_state.solution_count;
-            if state.solution_count == 1 {
-                state.first_solution_result = next_state.first_solution_result.clone();
-                state.solution_path = next_state.solution_path.clone();
-            }
             if state.solution_count > 1 {
                 return;
             }
         }
+
+        // Branch ONLY on the first eligible chunk. A complete solution
+        // assigns every chunk a position regardless of assignment order,
+        // and feasibility (overlap) is order-independent — trying other
+        // chunks first would only re-enumerate the same mappings in a
+        // different order (a factorial blow-up that hit the node cap and
+        // misreported unique solutions as ambiguous). For the same reason,
+        // if this chunk has no feasible position now it never will on this
+        // path, so the path is dead.
+        return;
     }
 }
 
@@ -776,6 +745,47 @@ mod tests {
         let chunk = make_chunk(&[], &["old"], &["new"], &[], 0);
         let result = apply_patch_backtracking(&original, &[chunk]).unwrap();
         assert_eq!(result, vec!["new"]);
+    }
+
+    /// Several IDENTICAL chunks matching several positions force the search
+    /// through every assignment permutation; all orders produce the same
+    /// file, so this must resolve as ONE solution, not ambiguity.
+    #[test]
+    fn test_identical_chunks_permutations_dedup_to_single_solution() {
+        let mut original: Vec<String> = Vec::new();
+        for i in 0..5 {
+            original.push(format!("keep {i}"));
+            original.push("dup".to_string());
+        }
+        let chunks: Vec<Chunk> = (0..5)
+            .map(|_| make_chunk(&[], &["dup"], &[], &[], 0))
+            .collect();
+        let result = apply_patch_backtracking(&original, &chunks).unwrap();
+        assert_eq!(
+            result,
+            vec!["keep 0", "keep 1", "keep 2", "keep 3", "keep 4"]
+        );
+    }
+
+    /// Regression: 7 interchangeable chunks used to explode the search into
+    /// chunk-order × position permutations, hit the node cap, and misreport
+    /// the unique solution as AmbiguousPatch. With order-free enumeration
+    /// and key-based dedup this must apply, and quickly.
+    #[test]
+    fn test_many_identical_chunks_resolve_instead_of_false_ambiguity() {
+        let mut original: Vec<String> = Vec::new();
+        for i in 0..2000 {
+            original.push(format!("keep {i}"));
+            if i % 300 == 0 {
+                original.push("dup".to_string());
+            }
+        }
+        let chunks: Vec<Chunk> = (0..7)
+            .map(|_| make_chunk(&[], &["dup"], &[], &[], 0))
+            .collect();
+        let result = apply_patch_backtracking(&original, &chunks).unwrap();
+        assert_eq!(result.len(), 2000);
+        assert!(result.iter().all(|l| l != "dup"));
     }
 
     // ── change_context constraint tests ──
