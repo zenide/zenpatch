@@ -121,6 +121,172 @@ pub fn apply(
     std::result::Result::Ok(new_vfs)
 }
 
+/// Re-joins patched lines with the file's dominant EOL and restores its trailing
+/// newline (so a one-line patch doesn't rewrite every ending or drop the final \n).
+fn rejoin(original_content: &str, applied_lines: &[std::string::String]) -> std::string::String {
+    let crlf_count = original_content.matches("\r\n").count();
+    let lf_only_count = original_content.matches('\n').count() - crlf_count;
+    let eol = if crlf_count > lf_only_count { "\r\n" } else { "\n" };
+    let mut updated = applied_lines.join(eol);
+    if original_content.ends_with('\n') && !updated.is_empty() {
+        updated.push_str(eol);
+    }
+    updated
+}
+
+/// Applies a single Update chunk to `lines`, trying strict then lenient whitespace.
+fn apply_one_chunk(
+    lines: &[std::string::String],
+    chunk: &crate::data::chunk::Chunk,
+) -> std::result::Result<std::vec::Vec<std::string::String>, crate::error::ZenpatchError> {
+    let single = std::slice::from_ref(chunk);
+    match crate::applier::backtracking_patcher::apply_patch_backtracking_mode(
+        lines,
+        single,
+        crate::applier::whitespace_mode::WhitespaceMode::Strict,
+    ) {
+        std::result::Result::Err(crate::error::ZenpatchError::PatchConflict(_))
+        | std::result::Result::Err(crate::error::ZenpatchError::AmbiguousPatch(_)) => {
+            crate::applier::backtracking_patcher::apply_patch_backtracking_mode(
+                lines,
+                single,
+                crate::applier::whitespace_mode::WhitespaceMode::Lenient,
+            )
+        }
+        other => other,
+    }
+}
+
+/// The outcome of a best-effort (partial) patch application.
+#[derive(Debug, Clone, Default)]
+pub struct PartialReport {
+    /// Number of Update hunks that applied (across all files).
+    pub applied_hunks: std::primitive::usize,
+    /// One human-readable message per hunk/action that was SKIPPED because it
+    /// did not apply. An empty list means the whole patch applied cleanly.
+    pub skipped: std::vec::Vec<std::string::String>,
+}
+
+/// Best-effort variant of [`apply`]: applies every hunk it can and SKIPS the ones
+/// that don't, instead of rejecting the whole patch when a single hunk is wrong.
+///
+/// For each Update file, the full set of hunks is first attempted atomically (the
+/// normal, highest-fidelity path); only if that fails does it fall back to applying
+/// each hunk independently, dropping the ones that conflict. The returned
+/// [`PartialReport`] lists what was skipped so the caller can re-prompt for just
+/// those. Only an unparseable patch returns `Err`.
+pub fn apply_partial(
+    patch_text: &str,
+    vfs: &crate::vfs::Vfs,
+) -> std::result::Result<(crate::vfs::Vfs, PartialReport), crate::error::ZenpatchError> {
+    let mut new_vfs = vfs.clone();
+    let mut report = PartialReport::default();
+    let actions = crate::parser::text_to_patch::text_to_patch(patch_text)?;
+
+    for action in actions {
+        match action.type_ {
+            crate::data::action_type::ActionType::Update => {
+                let original_content = match new_vfs.get(&action.path) {
+                    std::option::Option::Some(c) => c.to_string(),
+                    std::option::Option::None => {
+                        report.skipped.push(format!("{}: file not found", action.path));
+                        continue;
+                    }
+                };
+                let original_lines: std::vec::Vec<std::string::String> =
+                    original_content.lines().map(std::string::String::from).collect();
+
+                // 1. Try all hunks atomically (best fidelity / disambiguation).
+                let atomic = match crate::applier::backtracking_patcher::apply_patch_backtracking_mode(
+                    &original_lines,
+                    &action.chunks,
+                    crate::applier::whitespace_mode::WhitespaceMode::Strict,
+                ) {
+                    std::result::Result::Err(crate::error::ZenpatchError::PatchConflict(_))
+                    | std::result::Result::Err(crate::error::ZenpatchError::AmbiguousPatch(_)) => {
+                        crate::applier::backtracking_patcher::apply_patch_backtracking_mode(
+                            &original_lines,
+                            &action.chunks,
+                            crate::applier::whitespace_mode::WhitespaceMode::Lenient,
+                        )
+                    }
+                    other => other,
+                };
+
+                let final_lines = match atomic {
+                    std::result::Result::Ok(lines) => {
+                        report.applied_hunks += action.chunks.len();
+                        lines
+                    }
+                    std::result::Result::Err(_) => {
+                        // 2. Fall back to per-hunk best effort.
+                        let mut lines = original_lines.clone();
+                        for (i, chunk) in action.chunks.iter().enumerate() {
+                            match apply_one_chunk(&lines, chunk) {
+                                std::result::Result::Ok(updated) => {
+                                    lines = updated;
+                                    report.applied_hunks += 1;
+                                }
+                                std::result::Result::Err(e) => {
+                                    report.skipped.push(format!(
+                                        "{}: hunk {} skipped: {}",
+                                        action.path,
+                                        i + 1,
+                                        e
+                                    ));
+                                }
+                            }
+                        }
+                        lines
+                    }
+                };
+
+                if final_lines == original_lines {
+                    continue; // nothing applied for this file
+                }
+                let updated_content = rejoin(&original_content, &final_lines);
+                if let Some(new_path) = &action.new_path {
+                    new_vfs.remove(&action.path);
+                    new_vfs.insert(new_path.clone(), updated_content);
+                } else {
+                    new_vfs.insert(action.path.clone(), updated_content);
+                }
+            }
+            crate::data::action_type::ActionType::Add => {
+                if new_vfs.contains_key(&action.path) {
+                    report.skipped.push(format!("{}: add skipped (file exists)", action.path));
+                    continue;
+                }
+                let content: std::vec::Vec<std::string::String> =
+                    action.chunks.iter().flat_map(|c| c.ins_lines.clone()).collect();
+                new_vfs.insert(action.path.clone(), content.join("\n"));
+                report.applied_hunks += 1;
+            }
+            crate::data::action_type::ActionType::Delete => {
+                let original_content = match new_vfs.get(&action.path) {
+                    std::option::Option::Some(c) => c.to_string(),
+                    std::option::Option::None => {
+                        report.skipped.push(format!("{}: delete skipped (not found)", action.path));
+                        continue;
+                    }
+                };
+                let content_to_delete: std::vec::Vec<std::string::String> =
+                    action.chunks.iter().flat_map(|c| c.del_lines.clone()).collect();
+                let original_lines: std::vec::Vec<std::string::String> =
+                    original_content.lines().map(std::string::String::from).collect();
+                if content_to_delete == original_lines {
+                    new_vfs.remove(&action.path);
+                    report.applied_hunks += 1;
+                } else {
+                    report.skipped.push(format!("{}: delete skipped (content mismatch)", action.path));
+                }
+            }
+        }
+    }
+
+    std::result::Result::Ok((new_vfs, report))
+}
+
 #[cfg(test)]
 mod tests {
     // Note: VFS-based tests.
@@ -130,6 +296,33 @@ mod tests {
         let mut vfs = Vfs::new();
         vfs.insert(path.to_string(), content.to_string());
         vfs
+    }
+
+    #[test]
+    fn test_apply_partial_keeps_good_hunk_drops_bad() {
+        // Two hunks for one file: the first is applyable, the second's context
+        // ("ghost") does not exist. apply_partial must land the good one and skip
+        // the bad one (where atomic `apply` would reject the whole patch).
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+A\n@@\n ghost\n-real\n+REAL\n*** End Patch";
+        let vfs = vfs_from_str("a.txt", "a\nb\nreal");
+        // atomic apply fails outright
+        assert!(super::apply(patch, &vfs).is_err());
+        // partial apply lands the good hunk, reports the bad one
+        let (out, report) = super::apply_partial(patch, &vfs).unwrap();
+        assert_eq!(out.get("a.txt").unwrap(), "A\nb\nreal");
+        assert_eq!(report.applied_hunks, 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("ghost") || report.skipped[0].contains("hunk 2"));
+    }
+
+    #[test]
+    fn test_apply_partial_clean_patch_applies_all() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+A\n*** End Patch";
+        let vfs = vfs_from_str("a.txt", "a\nz\n");
+        let (out, report) = super::apply_partial(patch, &vfs).unwrap();
+        assert_eq!(out.get("a.txt").unwrap(), "A\nz\n");
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.applied_hunks, 1);
     }
 
     #[test]

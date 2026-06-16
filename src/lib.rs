@@ -13,6 +13,7 @@ pub mod vfs;
 pub mod get_llm_instructions;
 
 pub use apply::apply;
+pub use apply::{apply_partial, PartialReport};
 pub use error::ZenpatchError;
 pub use vfs::Vfs;
 pub use get_llm_instructions::get_llm_instructions;
