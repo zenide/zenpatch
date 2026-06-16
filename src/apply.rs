@@ -325,6 +325,29 @@ mod tests {
         assert_eq!(report.applied_hunks, 1);
     }
 
+    /// Regression: an inserted line whose preceding context (`};`) repeats — and
+    /// whose surrounding context (`r#type: Type::Type_Vector,`) appears in TWO
+    /// adjacent struct literals — must land after the FIRST struct's close, not
+    /// inside it. Reproduces the add_constant_vector mis-apply.
+    #[test]
+    fn test_apply_insert_after_ambiguous_struct_close() {
+        let file = "fn f() {\n        let c = Constant {\n            r#type: Type::Type_Vector,\n            value: zeroed(),\n        };\n\n        let mut k = ConstantKey {\n            r#type: Type::Type_Vector,\n            value: 0,\n        };\n}";
+        let patch = "*** Begin Patch\n*** Update File: f.rs\n@@\n-        let c = Constant {\n+        let mut c = Constant {\n             r#type: Type::Type_Vector,\n             value: zeroed(),\n         };\n+        c.value.vec = [x, y];\n \n        let mut k = ConstantKey {\n*** End Patch";
+        let vfs = vfs_from_str("f.rs", file);
+        let out = super::apply(patch, &vfs).unwrap();
+        let got = out.get("f.rs").unwrap();
+        // The inserted line must come AFTER the Constant's closing `};`.
+        assert!(
+            got.contains("        };\n        c.value.vec = [x, y];"),
+            "inserted line mis-placed:\n{got}"
+        );
+        // It must NOT be inside the struct literal.
+        assert!(
+            !got.contains("let mut c = Constant {\n        c.value.vec"),
+            "inserted line landed INSIDE the struct literal:\n{got}"
+        );
+    }
+
     #[test]
     fn test_apply_add_simple() {
         let patch = "*** Begin Patch\n*** Add File: new.txt\n+hello\n+world\n*** End Patch";

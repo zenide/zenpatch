@@ -400,15 +400,46 @@ fn find_match_positions(
 }
 
 fn apply_chunk(lines: &[String], chunk: &Chunk, pos: usize, mode: WhitespaceMode) -> Vec<String> {
-    let mut result: Vec<String> = Vec::new();
     let adj_pre = adjusted_pre_len(chunk, mode);
 
+    let mut result: Vec<String> = Vec::with_capacity(lines.len() + chunk.ins_lines.len());
+    // Prefix: everything before the chunk + its leading context (the leading context
+    // is copied verbatim from the original; `adj_pre` also folds the duplicated
+    // last-context-equals-first-deletion case so we don't consume that line twice).
     let start_copy = (pos + adj_pre).min(lines.len());
     result.extend_from_slice(&lines[..start_copy]);
-    result.extend(chunk.ins_lines.iter().cloned());
 
-    let end_del = (pos + adj_pre + chunk.del_lines.len()).min(lines.len());
-    result.extend_from_slice(&lines[end_del..]);
+    // Walk the chunk's lines IN ORDER from just past the leading context, so each
+    // insertion lands at its real position (a context block can sit between two
+    // insertions). The old code dumped ALL ins_lines at the deletion point, which
+    // mis-placed any insertion that followed an interior context line.
+    let mut cursor = start_copy;
+    let mut skipped_leading_ctx = 0usize;
+    for (lt, content) in chunk.lines.iter() {
+        match lt {
+            LineType::Context => {
+                if skipped_leading_ctx < adj_pre {
+                    // already emitted as part of the prefix above
+                    skipped_leading_ctx += 1;
+                    continue;
+                }
+                if cursor < lines.len() {
+                    result.push(lines[cursor].clone());
+                }
+                cursor += 1;
+            }
+            LineType::Deletion => {
+                cursor += 1; // drop the original line
+            }
+            LineType::Insertion => {
+                result.push(content.clone());
+            }
+        }
+    }
+
+    if cursor < lines.len() {
+        result.extend_from_slice(&lines[cursor..]);
+    }
     result
 }
 
