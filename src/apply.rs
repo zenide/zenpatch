@@ -19,6 +19,24 @@
 ///
 /// * `Ok(Vfs)` - The patched VFS on success.
 /// * `Err(ZenpatchError)` - An error if parsing or application fails.
+/// Resolve a patch's target path against the VFS. Returns the exact key when it
+/// exists; otherwise, if the model dropped a leading path prefix (e.g. wrote
+/// `crates/x.rs` for a VFS key `a/b/crates/x.rs`), returns the UNIQUE key whose
+/// path ends with the given path at a path boundary. Zero or multiple (ambiguous)
+/// suffix matches resolve to `None`, so a genuine miss stays a miss.
+pub fn resolve_vfs_path(vfs: &crate::vfs::Vfs, path: &str) -> std::option::Option<std::string::String> {
+    if vfs.contains_key(path) {
+        return std::option::Option::Some(path.to_string());
+    }
+    let needle = format!("/{}", path.trim_start_matches('/'));
+    let mut matches = vfs.keys().filter(|k| k.ends_with(&needle));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return std::option::Option::None; // ambiguous — refuse to guess
+    }
+    std::option::Option::Some(first.clone())
+}
+
 pub fn apply(
     patch_text: &str,
     vfs: &crate::vfs::Vfs,
@@ -29,8 +47,10 @@ pub fn apply(
     for action in actions {
         match action.type_ {
             crate::data::action_type::ActionType::Update => {
+                let key = resolve_vfs_path(&new_vfs, &action.path)
+                    .ok_or_else(|| crate::error::ZenpatchError::FileNotFound(action.path.clone()))?;
                 let original_content = new_vfs
-                    .get(&action.path)
+                    .get(&key)
                     .ok_or_else(|| crate::error::ZenpatchError::FileNotFound(action.path.clone()))?;
 
                 let original_lines: std::vec::Vec<std::string::String> =
@@ -71,10 +91,10 @@ pub fn apply(
 
                 if let Some(new_path) = &action.new_path {
                     // Handle rename
-                    new_vfs.remove(&action.path);
+                    new_vfs.remove(&key);
                     new_vfs.insert(new_path.clone(), updated_content);
                 } else {
-                    new_vfs.insert(action.path.clone(), updated_content);
+                    new_vfs.insert(key, updated_content);
                 }
             }
             crate::data::action_type::ActionType::Add => {
@@ -91,8 +111,10 @@ pub fn apply(
                 new_vfs.insert(action.path.clone(), content.join("\n"));
             }
             crate::data::action_type::ActionType::Delete => {
+                let key = resolve_vfs_path(&new_vfs, &action.path)
+                    .ok_or_else(|| crate::error::ZenpatchError::FileNotFound(action.path.clone()))?;
                 let original_content = new_vfs
-                    .get(&action.path)
+                    .get(&key)
                     .ok_or_else(|| crate::error::ZenpatchError::FileNotFound(action.path.clone()))?;
 
                 let content_to_delete: std::vec::Vec<std::string::String> = action
@@ -105,7 +127,7 @@ pub fn apply(
                     original_content.lines().map(std::string::String::from).collect();
 
                 if content_to_delete == original_lines {
-                    new_vfs.remove(&action.path);
+                    new_vfs.remove(&key);
                 } else {
                     return std::result::Result::Err(crate::error::ZenpatchError::PatchConflict(
                         format!(
@@ -186,13 +208,14 @@ pub fn apply_partial(
     for action in actions {
         match action.type_ {
             crate::data::action_type::ActionType::Update => {
-                let original_content = match new_vfs.get(&action.path) {
-                    std::option::Option::Some(c) => c.to_string(),
+                let key = match resolve_vfs_path(&new_vfs, &action.path) {
+                    std::option::Option::Some(k) => k,
                     std::option::Option::None => {
                         report.skipped.push(format!("{}: file not found", action.path));
                         continue;
                     }
                 };
+                let original_content = new_vfs.get(&key).map(|c| c.to_string()).unwrap_or_default();
                 let original_lines: std::vec::Vec<std::string::String> =
                     original_content.lines().map(std::string::String::from).collect();
 
@@ -246,10 +269,10 @@ pub fn apply_partial(
                 }
                 let updated_content = rejoin(&original_content, &final_lines);
                 if let Some(new_path) = &action.new_path {
-                    new_vfs.remove(&action.path);
+                    new_vfs.remove(&key);
                     new_vfs.insert(new_path.clone(), updated_content);
                 } else {
-                    new_vfs.insert(action.path.clone(), updated_content);
+                    new_vfs.insert(key, updated_content);
                 }
             }
             crate::data::action_type::ActionType::Add => {
@@ -263,19 +286,20 @@ pub fn apply_partial(
                 report.applied_hunks += 1;
             }
             crate::data::action_type::ActionType::Delete => {
-                let original_content = match new_vfs.get(&action.path) {
-                    std::option::Option::Some(c) => c.to_string(),
+                let key = match resolve_vfs_path(&new_vfs, &action.path) {
+                    std::option::Option::Some(k) => k,
                     std::option::Option::None => {
                         report.skipped.push(format!("{}: delete skipped (not found)", action.path));
                         continue;
                     }
                 };
+                let original_content = new_vfs.get(&key).map(|c| c.to_string()).unwrap_or_default();
                 let content_to_delete: std::vec::Vec<std::string::String> =
                     action.chunks.iter().flat_map(|c| c.del_lines.clone()).collect();
                 let original_lines: std::vec::Vec<std::string::String> =
                     original_content.lines().map(std::string::String::from).collect();
                 if content_to_delete == original_lines {
-                    new_vfs.remove(&action.path);
+                    new_vfs.remove(&key);
                     report.applied_hunks += 1;
                 } else {
                     report.skipped.push(format!("{}: delete skipped (content mismatch)", action.path));
@@ -346,6 +370,43 @@ mod tests {
             !got.contains("let mut c = Constant {\n        c.value.vec"),
             "inserted line landed INSIDE the struct literal:\n{got}"
         );
+    }
+
+    /// A patch that dropped a leading path prefix (`crates/x.rs` for VFS key
+    /// `a/b/crates/x.rs`) must still apply via unique suffix match.
+    #[test]
+    fn test_apply_resolves_dropped_path_prefix() {
+        let patch = "*** Begin Patch\n*** Update File: crates/x.rs\n@@\n-a\n+A\n*** End Patch";
+        let vfs = vfs_from_str("deep/root/crates/x.rs", "a\nz\n");
+        let out = super::apply(patch, &vfs).unwrap();
+        assert_eq!(out.get("deep/root/crates/x.rs").unwrap(), "A\nz\n");
+        // key preserved, no phantom file created
+        assert!(out.get("crates/x.rs").is_none());
+    }
+
+    /// Exact match always wins over a suffix match.
+    #[test]
+    fn test_resolve_prefers_exact_over_suffix() {
+        let mut vfs = Vfs::new();
+        vfs.insert("crates/x.rs".into(), "exact".into());
+        vfs.insert("deep/crates/x.rs".into(), "suffix".into());
+        assert_eq!(super::resolve_vfs_path(&vfs, "crates/x.rs").as_deref(), Some("crates/x.rs"));
+    }
+
+    /// Ambiguous suffix (two keys end with the path) must NOT guess.
+    #[test]
+    fn test_resolve_ambiguous_suffix_is_none() {
+        let mut vfs = Vfs::new();
+        vfs.insert("a/crates/x.rs".into(), "1".into());
+        vfs.insert("b/crates/x.rs".into(), "2".into());
+        assert_eq!(super::resolve_vfs_path(&vfs, "crates/x.rs"), None);
+    }
+
+    /// A suffix that isn't on a path boundary must not match (`x.rs` vs `ax.rs`).
+    #[test]
+    fn test_resolve_requires_path_boundary() {
+        let vfs = vfs_from_str("dir/prefix_x.rs", "c");
+        assert_eq!(super::resolve_vfs_path(&vfs, "x.rs"), None);
     }
 
     #[test]
